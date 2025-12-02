@@ -1,0 +1,88 @@
+=== SMART LOOKUP TEST CASES ===
+
+Copy these into Smart Lookup mode and watch AI work its magic!
+
+TEST 1: SIMPLE NAME + COMPANY
+────────────────────────────────
+John Doe, Tesla
+Jane Smith, Microsoft
+
+
+TEST 2: CONVERSATIONAL REQUESTS
+────────────────────────────────
+Find email for Elon Musk at Tesla
+Get me contact for Tim Cook at Apple
+
+
+TEST 3: ROLE-BASED LOOKUP
+────────────────────────────────
+CEO of SpaceX
+CTO of Stripe
+CFO of Microsoft
+
+
+TEST 4: MESSY TEXT (Like from documents)
+────────────────────────────────
+John Doe works at Tesla as an engineer
+Jane Smith from Microsoft - Product Manager
+Contact: Elon Musk, SpaceX Inc. (CEO)
+
+
+TEST 5: TABLE FORMAT (Copy from Excel)
+────────────────────────────────
+Name          | Company
+John Doe      | Tesla
+Jane Smith    | Microsoft
+Elon Musk     | SpaceX
+
+
+TEST 6: MIXED CHAOS
+────────────────────────────────
+John at Tesla
+Jane, Microsoft
+CEO of SpaceX
+Tim Cook - Apple
+
+
+TEST 7: URL FORMATS
+────────────────────────────────
+John Doe, https://tesla.com
+Jane Smith at www.microsoft.com
+Elon Musk (spacex.com)
+
+
+TEST 8: MULTIPLE ROLES
+────────────────────────────────
+Find emails for:
+CEO of Tesla
+CTO of Microsoft
+CFO of Apple
+
+
+EXPECTED RESULTS:
+─────────────────
+For each person:
+✅ AI extracts: firstName, lastName, company, role (if any)
+✅ AI looks up domain (shows in insights)
+✅ Generates 8 email variations
+✅ Verifies all variations
+✅ Shows verified vs unverified split
+
+
+WHAT TO WATCH FOR:
+─────────────────
+🔍 AI Insights Panel:
+- "Looking up domain for Tesla..."
+- "✓ Found: Tesla → tesla.com"
+- "Looking up CEO of SpaceX..."
+- "✓ Found: Elon Musk"
+
+📊 Results:
+- Left column: ✅ Deliverable emails (green)
+- Right column: ❌ Undeliverable (red)
+- Copy buttons on each verified email
+- "Copy All Verified" button
+- "Export CSV" button
+
+
+TIP: Use your actual OpenAI key provided earlier!
