@@ -1,0 +1,33 @@
+# Environment
+.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Database (deployed separately — don't ship local DB)
+outreach_engine/db/outreach.db
+outreach_engine/db/outreach.db-shm
+outreach_engine/db/outreach.db-wal
+outreach_engine/db/backups/
+
+# Generated files
+outreach_engine/onepagers/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude
+.claude/

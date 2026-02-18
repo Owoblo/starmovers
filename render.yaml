@@ -1,0 +1,55 @@
+services:
+  - type: web
+    name: starmovers-outreach
+    runtime: python
+    region: ohio
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m outreach_engine.sidecar
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.0"
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        sync: false
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: SMTP_FROM_EMAIL
+        sync: false
+      - key: SMTP_FROM_NAME
+        sync: false
+      - key: SMTP_USE_SSL
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: LLM_MODEL
+        value: "gpt-4o-mini"
+      - key: SIDECAR_PORT
+        value: "10000"
+      - key: DATA_DIR
+        value: "/data"
+      - key: SIDECAR_PUBLIC_URL
+        sync: false
+      - key: NOTIFICATION_EMAIL
+        value: "johnowolabi80@gmail.com"
+      - key: AUTO_APPROVE
+        value: "true"
+      - key: AUTO_SCHEDULE
+        value: "true"
+      - key: MAX_DAILY_SENDS
+        value: "80"
+      - key: DAILY_SEND_TARGET
+        value: "40"
+      - key: PIPELINE_HOUR
+        value: "9"
+      - key: FOLLOWUP_HOUR
+        value: "11"
+      - key: SCHEDULER_TIMEZONE
+        value: "America/Toronto"
+    disk:
+      name: outreach-data
+      mountPath: /data
+      sizeGB: 1
