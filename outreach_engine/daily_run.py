@@ -356,12 +356,206 @@ def step_followups() -> dict:
         return {}
 
 
+def _build_sent_today_section() -> str:
+    """Build detailed list of emails sent today."""
+    import sqlite3
+    conn = sqlite3.connect(str(cfg.db_path), timeout=30)
+    conn.row_factory = sqlite3.Row
+    today = date.today().isoformat()
+
+    rows = conn.execute("""
+        SELECT b.id, b.email_subject, b.sent_at, b.open_count,
+               c.company_name, c.contact_name, c.discovered_email,
+               c.city, c.tier, c.confidence_score
+        FROM outreach_bundles b
+        JOIN contacts c ON b.contact_id = c.id
+        WHERE b.status IN ('sent', 'replied') AND DATE(b.sent_at) = ?
+        ORDER BY b.sent_at ASC
+    """, (today,)).fetchall()
+    conn.close()
+
+    if not rows:
+        return "  (none sent today)\n"
+
+    lines = []
+    for i, r in enumerate(rows, 1):
+        name = r["contact_name"] or "Unknown"
+        lines.append(
+            f"  {i}. {r['company_name']} — {name}\n"
+            f"     Email: {r['discovered_email']}\n"
+            f"     Subject: {r['email_subject'][:60]}\n"
+            f"     City: {r['city']} | Tier: {r['tier']} | Confidence: {r['confidence_score']}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _build_tomorrow_queue_section() -> str:
+    """Build detailed list of bundles queued/approved for tomorrow."""
+    import sqlite3
+    conn = sqlite3.connect(str(cfg.db_path), timeout=30)
+    conn.row_factory = sqlite3.Row
+
+    rows = conn.execute("""
+        SELECT b.id, b.email_subject, b.status,
+               c.company_name, c.contact_name, c.discovered_email,
+               c.city, c.tier, c.confidence_score, c.email_status
+        FROM outreach_bundles b
+        JOIN contacts c ON b.contact_id = c.id
+        WHERE b.status IN ('queued', 'approved')
+        ORDER BY c.confidence_score DESC, c.priority_score DESC
+    """).fetchall()
+    conn.close()
+
+    if not rows:
+        return "  (none queued)\n"
+
+    lines = []
+    for i, r in enumerate(rows, 1):
+        name = r["contact_name"] or "Unknown"
+        status_tag = "AUTO-APPROVED" if r["status"] == "approved" else "QUEUED"
+        email_tag = f"({r['email_status']})" if r["email_status"] != "verified" else "(verified)"
+        lines.append(
+            f"  {i}. [{status_tag}] {r['company_name']} — {name}\n"
+            f"     Email: {r['discovered_email']} {email_tag}\n"
+            f"     Subject: {r['email_subject'][:60]}\n"
+            f"     City: {r['city']} | Tier: {r['tier']} | Confidence: {r['confidence_score']}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _build_needs_attention_section() -> str:
+    """Build list of contacts that need human input.
+
+    Includes: bounced (recovery failed), low confidence high-value,
+    no decision maker found, stuck contacts.
+    """
+    import sqlite3
+    conn = sqlite3.connect(str(cfg.db_path), timeout=30)
+    conn.row_factory = sqlite3.Row
+
+    sections = []
+
+    # 1. Bounced emails where recovery failed (no new email found)
+    bounced = conn.execute("""
+        SELECT c.id, c.company_name, c.contact_name, c.city, c.tier,
+               c.bounce_count, c.bounced_emails, c.website,
+               c.confidence_score
+        FROM contacts c
+        WHERE c.bounce_count > 0
+        AND c.email_status IN ('bounced', 'invalid')
+        AND c.account_status NOT IN ('dnc', 'revisit')
+        ORDER BY c.tier ASC, c.bounce_count DESC
+        LIMIT 15
+    """).fetchall()
+
+    if bounced:
+        lines = ["  BOUNCED — Recovery Failed (need manual research):"]
+        for r in bounced:
+            bad_emails = r["bounced_emails"] or "unknown"
+            lines.append(
+                f"    • {r['company_name']} ({r['city']}) — Tier {r['tier']}\n"
+                f"      Contact: {r['contact_name'] or 'Unknown'}\n"
+                f"      Bounced {r['bounce_count']}x: {bad_emails}\n"
+                f"      Website: {r['website'] or 'none'}\n"
+                f"      → Need: correct email or new contact name/title"
+            )
+        sections.append("\n".join(lines))
+
+    # 2. High-value contacts with low confidence (can't find enough info)
+    low_conf = conn.execute("""
+        SELECT c.id, c.company_name, c.contact_name, c.city, c.tier,
+               c.confidence_score, c.email_status, c.discovered_email,
+               c.website, c.phone, c.decision_maker_found
+        FROM contacts c
+        WHERE c.tier IN ('A', 'HOT')
+        AND c.confidence_score < 40
+        AND c.account_status NOT IN ('dnc', 'partnered')
+        ORDER BY c.confidence_score ASC
+        LIMIT 15
+    """).fetchall()
+
+    if low_conf:
+        lines = ["\n  LOW CONFIDENCE — High-Value Accounts (need intel):"]
+        for r in low_conf:
+            missing = []
+            if not r["discovered_email"]:
+                missing.append("email")
+            if not r["phone"]:
+                missing.append("phone")
+            if not r["website"]:
+                missing.append("website")
+            if not r["decision_maker_found"] and not r["contact_name"]:
+                missing.append("decision maker")
+            lines.append(
+                f"    • {r['company_name']} ({r['city']}) — Tier {r['tier']}, Score: {r['confidence_score']}\n"
+                f"      Contact: {r['contact_name'] or 'NONE FOUND'}\n"
+                f"      Missing: {', '.join(missing) if missing else 'needs verification'}\n"
+                f"      → Need: {', '.join(missing) if missing else 'verify contact info'}"
+            )
+        sections.append("\n".join(lines))
+
+    # 3. Contacts stuck in contacted with multiple touches but no engagement
+    stuck = conn.execute("""
+        SELECT c.id, c.company_name, c.contact_name, c.city, c.tier,
+               c.discovered_email, c.confidence_score, c.last_touch_date,
+               (SELECT COUNT(*) FROM touch_log t
+                WHERE t.contact_id = c.id AND t.direction = 'outbound') as touch_count
+        FROM contacts c
+        WHERE c.account_status = 'contacted'
+        AND c.account_status != 'dnc'
+        HAVING touch_count >= 2
+        ORDER BY touch_count DESC
+        LIMIT 10
+    """).fetchall()
+
+    if stuck:
+        lines = ["\n  STUCK — Multiple Touches, No Engagement:"]
+        for r in stuck:
+            lines.append(
+                f"    • {r['company_name']} ({r['city']}) — {r['touch_count']} touches\n"
+                f"      Contact: {r['contact_name'] or 'Unknown'} | {r['discovered_email']}\n"
+                f"      Last touch: {r['last_touch_date'] or 'unknown'}\n"
+                f"      → Consider: phone call, LinkedIn, or different contact person"
+            )
+        sections.append("\n".join(lines))
+
+    conn.close()
+
+    if not sections:
+        return "  All clear — no contacts need immediate attention.\n"
+
+    return "\n".join(sections) + "\n"
+
+
+def _build_account_board_summary() -> str:
+    """Build account board status breakdown."""
+    board_stats = queue_manager.get_account_board_stats()
+    by_status = board_stats.get("by_status", {})
+
+    status_order = ["cold", "contacted", "engaged", "qualified",
+                    "partnered", "revisit", "dnc"]
+    lines = []
+    for s in status_order:
+        info = by_status.get(s, {})
+        count = info.get("count", 0)
+        avg = info.get("avg_confidence", 0)
+        if count > 0:
+            lines.append(f"  {s.upper():12s} {count:>5d} contacts  (avg confidence: {avg})")
+
+    lines.append(f"\n  High Confidence (>70):  {board_stats.get('high_confidence', 0)}")
+    lines.append(f"  Needs Review (40-69):  {board_stats.get('needs_review', 0)}")
+    lines.append(f"  Low Confidence (<40):  {board_stats.get('low_confidence', 0)}")
+
+    return "\n".join(lines) + "\n"
+
+
 def step_notify(discovered: int, generated: int, sent: int,
                 reply_stats: dict | None = None, failed: int = 0,
                 auto_approved: int = 0, followup_stats: dict | None = None,
-                news_stats: dict | None = None):
-    """Step 6: Send notification email with daily summary."""
-    if not cfg.notification_email or not cfg.smtp_password:
+                news_stats: dict | None = None,
+                account_stats: dict | None = None):
+    """Step 6: Send detailed notification email with full run summary."""
+    if not cfg.smtp_password:
         logger.info("Step 6: Notification skipped (no SMTP config)")
         return
 
@@ -401,41 +595,89 @@ NEWS SIGNALS:
   {news_stats.get('sources_scanned', 0)} sources scanned
 """
 
-    cap_info = ""
-    can_send, sent_today, max_sends = queue_manager.check_daily_send_cap()
-    cap_info = f"  Send Cap: {sent_today}/{max_sends}"
+    # Build account maintenance section
+    acct_section = ""
+    if account_stats:
+        acct_section = f"""
+ACCOUNT MAINTENANCE:
+  {account_stats.get('recalculated', 0)} confidence scores recalculated
+  {account_stats.get('reactivated', 0)} revisit contacts reactivated
+  {account_stats.get('parked', 0)} contacts parked (no reply)
+"""
 
-    body = f"""Saturn Star Movers — Daily Pipeline Summary (AUTONOMOUS)
-{'=' * 50}
+    can_send, sent_today, max_sends = queue_manager.check_daily_send_cap()
+
+    # Build the detailed sections
+    sent_detail = _build_sent_today_section()
+    tomorrow_detail = _build_tomorrow_queue_section()
+    attention_detail = _build_needs_attention_section()
+    board_summary = _build_account_board_summary()
+
+    body = f"""Saturn Star Movers — Daily Pipeline Report
+{'=' * 55}
 Date: {today}
 
-SENT TODAY: {sent} emails sent{f' ({failed} failed)' if failed else ''}
-AUTO-APPROVED: {auto_approved} bundles
-PREPPED FOR TOMORROW: {generated} bundles queued
-EMAILS DISCOVERED: {discovered}
-{reply_section}{followup_section}{news_section}
-PIPELINE STATS:
+OVERVIEW:
+  Sent today: {sent}{f' ({failed} failed)' if failed else ''}
+  Auto-approved: {auto_approved} bundles
+  Queued for tomorrow: {generated}
+  Emails discovered: {discovered}
+  Send cap: {sent_today}/{max_sends} used
+{reply_section}{followup_section}{news_section}{acct_section}
+{'─' * 55}
+EMAILS SENT TODAY — Full Detail
+{'─' * 55}
+{sent_detail}
+{'─' * 55}
+QUEUED FOR TOMORROW — Ready to Send
+{'─' * 55}
+{tomorrow_detail}
+{'─' * 55}
+⚠ NEEDS YOUR ATTENTION
+{'─' * 55}
+{attention_detail}
+{'─' * 55}
+ACCOUNT BOARD
+{'─' * 55}
+{board_summary}
+{'─' * 55}
+PIPELINE TOTALS (all time)
+{'─' * 55}
   Total Contacts: {stats['total_contacts']}
   Emails Found: {stats['emails_found']}
-  Total Sent (all time): {stats['total_sent']}
+  Total Sent: {stats['total_sent']}
   Open Rate: {stats['open_rate']}%
   Total Replied: {stats['total_replied']}
   Bounced: {stats['total_bounced']}
   Queue: {stats['total_queued']} queued, {stats['total_approved']} approved
   Remaining: {stats['contacts_remaining']} contacts not yet reached
-{cap_info}
 
-— Saturn Star Outreach Engine (Autonomous Mode)"""
+— Saturn Star Outreach Engine (Autonomous Mode)
+  Reply to this email or update the dashboard to feed back intel.
+  Dashboard: {cfg.dashboard_url}
+  API: {cfg.sidecar_public_url}/docs"""
 
-    try:
-        send_email(
-            cfg.notification_email,
-            f"Outreach Pipeline — {today}: {sent} sent, {generated} queued",
-            body,
-        )
-        logger.info("Step 6: Notification sent to %s", cfg.notification_email)
-    except Exception as e:
-        logger.warning("Step 6: Notification failed: %s", e)
+    subject = (
+        f"Saturn Star Daily Report — {today}: "
+        f"{sent} sent, {generated} queued"
+        f"{f', {failed} failed' if failed else ''}"
+    )
+
+    # Send to notification email
+    notify_targets = [cfg.notification_email]
+    # Also send to business email if different
+    biz_email = "business@starmovers.ca"
+    if biz_email != cfg.notification_email:
+        notify_targets.append(biz_email)
+
+    for target in notify_targets:
+        if not target:
+            continue
+        try:
+            send_email(target, subject, body)
+            logger.info("Step 6: Report sent to %s", target)
+        except Exception as e:
+            logger.warning("Step 6: Report to %s failed: %s", target, e)
 
 
 def step_flywheel() -> dict:
@@ -493,7 +735,7 @@ def run_daily_pipeline():
     try:
         step_scan_bounces()
         reply_stats = step_scan_replies()
-        step_account_maintenance()
+        acct_stats = step_account_maintenance()
         discovered = step_discover(cfg.discovery_batch_size)
         generated = step_generate_bundles(cfg.daily_send_target)
         auto_approved = step_auto_approve()
@@ -512,7 +754,8 @@ def run_daily_pipeline():
         step_backup()
         step_notify(discovered, generated, sent, reply_stats=reply_stats,
                     failed=failed, auto_approved=auto_approved,
-                    followup_stats=followup_stats, news_stats=news_stats)
+                    followup_stats=followup_stats, news_stats=news_stats,
+                    account_stats=acct_stats)
 
         results = {
             "discovered": discovered, "generated": generated,
@@ -604,6 +847,7 @@ def run_daily_pipeline_headless(batch_size: int = 20) -> dict:
             auto_approved=results["auto_approved"],
             followup_stats=results["followups"],
             news_stats=results["news_stats"],
+            account_stats=results.get("account_maintenance"),
         )
 
         # Step 7: Backup
