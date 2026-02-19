@@ -85,5 +85,31 @@ class _Config:
     )
     backup_keep_days: int = int(os.getenv("BACKUP_KEEP_DAYS", "7"))
 
+    # Confidence scoring weights
+    confidence_weights: dict = {
+        "email_verified": 20,
+        "email_likely": 10,
+        "decision_maker_found": 15,
+        "website_exists": 10,
+        "phone_exists": 10,
+        "high_value_tier": 10,
+        "has_news_signal": 10,
+        "account_engaged": 10,
+        "has_opens": 5,
+        "recent_activity": 10,
+    }
+
+    # Confidence routing thresholds
+    confidence_auto_threshold: int = int(os.getenv("CONFIDENCE_AUTO_THRESHOLD", "70"))
+    confidence_manual_threshold: int = int(os.getenv("CONFIDENCE_MANUAL_THRESHOLD", "40"))
+
+    # Account revisit timers (days)
+    revisit_no_reply_days: int = int(os.getenv("REVISIT_NO_REPLY_DAYS", "75"))
+    revisit_negative_days: int = int(os.getenv("REVISIT_NEGATIVE_DAYS", "180"))
+    revisit_bounce_days: int = int(os.getenv("REVISIT_BOUNCE_DAYS", "90"))
+
+    # Account maintenance schedule
+    account_maintenance_hour: int = int(os.getenv("ACCOUNT_MAINTENANCE_HOUR", "8"))
+
 
 cfg = _Config()

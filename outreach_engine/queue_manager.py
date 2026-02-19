@@ -300,6 +300,7 @@ def select_next_batch(batch_size: int = 40) -> list[int]:
         WHERE c.outreach_status = 'pending'
         AND c.email_status IN ('verified', 'likely')
         AND c.discovered_email != ''
+        AND c.account_status != 'dnc'
         AND c.id NOT IN (
             SELECT contact_id FROM outreach_bundles WHERE status NOT IN ('skipped', 'bounced')
         )
@@ -486,6 +487,7 @@ def get_up_next(limit: int = 20) -> list[dict]:
         WHERE c.outreach_status = 'pending'
         AND c.email_status IN ('verified', 'likely')
         AND c.discovered_email != ''
+        AND c.account_status != 'dnc'
         AND c.id NOT IN (
             SELECT contact_id FROM outreach_bundles WHERE status NOT IN ('skipped', 'bounced')
         )
@@ -504,6 +506,7 @@ def get_up_next_total() -> int:
         WHERE c.outreach_status = 'pending'
         AND c.email_status IN ('verified', 'likely')
         AND c.discovered_email != ''
+        AND c.account_status != 'dnc'
         AND c.id NOT IN (
             SELECT contact_id FROM outreach_bundles WHERE status NOT IN ('skipped', 'bounced')
         )
@@ -936,3 +939,404 @@ def list_backups() -> list[dict]:
          "created": datetime.fromtimestamp(b.stat().st_mtime).isoformat()}
         for b in backups
     ]
+
+
+# ── Account Board ──
+
+
+def get_account_board(status: Optional[str] = None, limit: int = 100,
+                      offset: int = 0) -> list[dict]:
+    """Get contacts grouped by account_status for the board view."""
+    conn = _get_conn()
+    where = "WHERE c.account_status != 'dnc'" if not status else "WHERE c.account_status = ?"
+    params: list = [] if not status else [status]
+
+    rows = conn.execute(f"""
+        SELECT c.id, c.company_name, c.contact_name, c.title_role,
+               c.tier, c.industry_code, c.city, c.website, c.phone,
+               c.discovered_email, c.email_status,
+               c.company_size, c.company_type, c.confidence_score,
+               c.account_status, c.last_touch_date, c.next_action_date,
+               c.next_action, c.decision_maker_found, c.procurement_required,
+               (SELECT COUNT(*) FROM touch_log t WHERE t.contact_id = c.id) as touch_count,
+               (SELECT COUNT(*) FROM outreach_bundles ob
+                WHERE ob.contact_id = c.id AND ob.open_count > 0) as opens
+        FROM contacts c
+        {where}
+        ORDER BY c.confidence_score DESC, c.priority_score DESC
+        LIMIT ? OFFSET ?
+    """, (*params, limit, offset)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_account_board_stats() -> dict:
+    """Get account board summary statistics."""
+    conn = _get_conn()
+    by_status = conn.execute("""
+        SELECT account_status, COUNT(*) as cnt,
+               AVG(confidence_score) as avg_confidence
+        FROM contacts
+        GROUP BY account_status
+    """).fetchall()
+
+    total = conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
+    high_confidence = conn.execute(
+        "SELECT COUNT(*) FROM contacts WHERE confidence_score >= 70"
+    ).fetchone()[0]
+    needs_review = conn.execute(
+        "SELECT COUNT(*) FROM contacts WHERE confidence_score BETWEEN 40 AND 69"
+    ).fetchone()[0]
+    low_confidence = conn.execute(
+        "SELECT COUNT(*) FROM contacts WHERE confidence_score < 40 AND account_status != 'dnc'"
+    ).fetchone()[0]
+
+    conn.close()
+    return {
+        "total": total,
+        "by_status": {r["account_status"]: {"count": r["cnt"],
+                      "avg_confidence": round(r["avg_confidence"] or 0, 1)}
+                      for r in by_status},
+        "high_confidence": high_confidence,
+        "needs_review": needs_review,
+        "low_confidence": low_confidence,
+    }
+
+
+def get_account_detail(contact_id: int) -> Optional[dict]:
+    """Get full account detail including touches and bundles."""
+    conn = _get_conn()
+    contact = conn.execute("SELECT * FROM contacts WHERE id = ?",
+                           (contact_id,)).fetchone()
+    if not contact:
+        conn.close()
+        return None
+
+    touches = conn.execute("""
+        SELECT * FROM touch_log WHERE contact_id = ?
+        ORDER BY touch_date DESC LIMIT 50
+    """, (contact_id,)).fetchall()
+
+    bundles = conn.execute("""
+        SELECT id, batch_date, status, email_subject, sent_at, open_count,
+               reply_type, reply_snippet
+        FROM outreach_bundles WHERE contact_id = ?
+        ORDER BY created_at DESC
+    """, (contact_id,)).fetchall()
+
+    jobs = conn.execute("""
+        SELECT * FROM jobs WHERE contact_id = ?
+        ORDER BY created_at DESC
+    """, (contact_id,)).fetchall()
+
+    conn.close()
+    return {
+        "contact": dict(contact),
+        "touches": [dict(t) for t in touches],
+        "bundles": [dict(b) for b in bundles],
+        "jobs": [dict(j) for j in jobs],
+    }
+
+
+# ── Touch Log CRUD ──
+
+
+def log_touch(contact_id: int, channel: str, direction: str = "outbound",
+              subject: str = "", notes: str = "", outcome: str = "",
+              logged_by: str = "system") -> int:
+    """Log a multi-channel touch. Returns touch_log id."""
+    conn = _get_conn()
+    cur = conn.execute("""
+        INSERT INTO touch_log (contact_id, channel, direction, subject,
+                               notes, outcome, logged_by, touch_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (contact_id, channel, direction, subject, notes, outcome,
+          logged_by, date.today().isoformat()))
+    tid = cur.lastrowid
+    # Update last_touch_date
+    conn.execute(
+        "UPDATE contacts SET last_touch_date = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (date.today().isoformat(), contact_id),
+    )
+    conn.commit()
+    conn.close()
+    return tid
+
+
+def get_touches(contact_id: int, limit: int = 50) -> list[dict]:
+    """Get touch log for a contact."""
+    conn = _get_conn()
+    rows = conn.execute("""
+        SELECT * FROM touch_log WHERE contact_id = ?
+        ORDER BY touch_date DESC, created_at DESC LIMIT ?
+    """, (contact_id, limit)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_touch_stats() -> dict:
+    """Get touch statistics across all contacts."""
+    conn = _get_conn()
+    by_channel = conn.execute("""
+        SELECT channel, COUNT(*) as cnt FROM touch_log GROUP BY channel
+    """).fetchall()
+    by_direction = conn.execute("""
+        SELECT direction, COUNT(*) as cnt FROM touch_log GROUP BY direction
+    """).fetchall()
+    total = conn.execute("SELECT COUNT(*) FROM touch_log").fetchone()[0]
+    conn.close()
+    return {
+        "total": total,
+        "by_channel": {r["channel"]: r["cnt"] for r in by_channel},
+        "by_direction": {r["direction"]: r["cnt"] for r in by_direction},
+    }
+
+
+# ── Ecosystem Contacts CRUD ──
+
+
+def create_ecosystem_contact(name: str, role: str, email: str = "",
+                             phone: str = "", company: str = "",
+                             source_contact_id: Optional[int] = None,
+                             notes: str = "") -> int:
+    """Create an ecosystem contact (realtor, lawyer, broker, etc). Returns id."""
+    conn = _get_conn()
+    cur = conn.execute("""
+        INSERT INTO ecosystem_contacts (name, email, phone, role, company,
+                                        source_contact_id, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (name, email, phone, role, company, source_contact_id, notes))
+    eid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return eid
+
+
+def get_ecosystem_contacts(role: Optional[str] = None,
+                           limit: int = 50, offset: int = 0) -> list[dict]:
+    """List ecosystem contacts with optional role filter."""
+    conn = _get_conn()
+    if role:
+        rows = conn.execute("""
+            SELECT * FROM ecosystem_contacts WHERE role = ?
+            ORDER BY created_at DESC LIMIT ? OFFSET ?
+        """, (role, limit, offset)).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT * FROM ecosystem_contacts
+            ORDER BY created_at DESC LIMIT ? OFFSET ?
+        """, (limit, offset)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def promote_ecosystem_contact(ecosystem_id: int) -> Optional[int]:
+    """Promote an ecosystem contact to a full CRM contact.
+
+    Returns the new contact_id, or None if failed.
+    """
+    conn = _get_conn()
+    eco = conn.execute(
+        "SELECT * FROM ecosystem_contacts WHERE id = ?", (ecosystem_id,)
+    ).fetchone()
+    if not eco:
+        conn.close()
+        return None
+
+    # Create a new contact
+    cur = conn.execute("""
+        INSERT INTO contacts (company_name, contact_name, phone, discovered_email,
+                              email_status, tier, priority_score, notes,
+                              csv_source, outreach_status, account_status)
+        VALUES (?, ?, ?, ?, ?, 'B', 60, ?, 'ecosystem_promote', 'pending', 'cold')
+    """, (
+        eco["company"] or eco["name"],
+        eco["name"],
+        eco["phone"] or "",
+        eco["email"] or "",
+        "likely" if eco["email"] else "pending",
+        f"Promoted from ecosystem ({eco['role']}). {eco['notes'] or ''}",
+    ))
+    new_id = cur.lastrowid
+
+    # Mark the ecosystem contact as promoted
+    conn.execute(
+        "UPDATE ecosystem_contacts SET promoted_contact_id = ? WHERE id = ?",
+        (new_id, ecosystem_id),
+    )
+    conn.commit()
+    conn.close()
+    return new_id
+
+
+# ── Partner Codes CRUD ──
+
+
+def create_partner_code(partner_name: str, code: str,
+                        discount_percent: float = 0,
+                        bonus_per_referral: float = 0) -> int:
+    """Create a partner code. Returns id."""
+    conn = _get_conn()
+    cur = conn.execute("""
+        INSERT INTO partner_codes (partner_name, code, discount_percent,
+                                   bonus_per_referral)
+        VALUES (?, ?, ?, ?)
+    """, (partner_name, code.upper(), discount_percent, bonus_per_referral))
+    pid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return pid
+
+
+def get_partner_codes(status: str = "active",
+                      limit: int = 50) -> list[dict]:
+    """List partner codes."""
+    conn = _get_conn()
+    rows = conn.execute("""
+        SELECT * FROM partner_codes
+        WHERE status = ?
+        ORDER BY total_revenue DESC
+        LIMIT ?
+    """, (status, limit)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def lookup_partner_code(code: str) -> Optional[dict]:
+    """Look up a partner code."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM partner_codes WHERE code = ?", (code.upper(),)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+# ── Jobs CRUD ──
+
+
+def create_job(contact_id: Optional[int] = None, partner_code: str = "",
+               job_type: str = "commercial", quote_amount: float = 0,
+               move_date: str = "", origin_address: str = "",
+               destination_address: str = "", crew_size: int = 0,
+               truck_count: int = 0, notes: str = "") -> int:
+    """Create a job. Returns job id."""
+    conn = _get_conn()
+    cur = conn.execute("""
+        INSERT INTO jobs (contact_id, partner_code, job_type, status,
+                          quote_amount, move_date, origin_address,
+                          destination_address, crew_size, truck_count, notes)
+        VALUES (?, ?, ?, 'quoted', ?, ?, ?, ?, ?, ?, ?)
+    """, (contact_id, partner_code.upper() if partner_code else "",
+          job_type, quote_amount, move_date, origin_address,
+          destination_address, crew_size, truck_count, notes))
+    jid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return jid
+
+
+def get_jobs(status: Optional[str] = None, limit: int = 50,
+             offset: int = 0) -> list[dict]:
+    """List jobs with optional status filter."""
+    conn = _get_conn()
+    if status:
+        rows = conn.execute("""
+            SELECT j.*, c.company_name, c.contact_name
+            FROM jobs j
+            LEFT JOIN contacts c ON j.contact_id = c.id
+            WHERE j.status = ?
+            ORDER BY j.created_at DESC LIMIT ? OFFSET ?
+        """, (status, limit, offset)).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT j.*, c.company_name, c.contact_name
+            FROM jobs j
+            LEFT JOIN contacts c ON j.contact_id = c.id
+            ORDER BY j.created_at DESC LIMIT ? OFFSET ?
+        """, (limit, offset)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_job(job_id: int) -> Optional[dict]:
+    """Get a single job with contact info."""
+    conn = _get_conn()
+    row = conn.execute("""
+        SELECT j.*, c.company_name, c.contact_name
+        FROM jobs j
+        LEFT JOIN contacts c ON j.contact_id = c.id
+        WHERE j.id = ?
+    """, (job_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def update_job(job_id: int, **kwargs) -> bool:
+    """Update a job. Handles partner revenue attribution on completion."""
+    conn = _get_conn()
+    job = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    if not job:
+        conn.close()
+        return False
+
+    updates = []
+    params = []
+    for k, v in kwargs.items():
+        if v is not None and k in ("status", "final_amount", "move_date",
+                                    "crew_size", "truck_count", "labor_hours",
+                                    "notes"):
+            updates.append(f"{k} = ?")
+            params.append(v)
+
+    if not updates:
+        conn.close()
+        return False
+
+    updates.append("updated_at = CURRENT_TIMESTAMP")
+    params.append(job_id)
+    conn.execute(f"UPDATE jobs SET {', '.join(updates)} WHERE id = ?", params)
+
+    # Partner revenue attribution on completion
+    new_status = kwargs.get("status")
+    if new_status == "completed" and job["partner_code"]:
+        final = kwargs.get("final_amount", job["final_amount"]) or job["quote_amount"]
+        conn.execute("""
+            UPDATE partner_codes
+            SET total_referrals = total_referrals + 1,
+                total_revenue = total_revenue + ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE code = ?
+        """, (final, job["partner_code"]))
+
+    conn.commit()
+    conn.close()
+    return True
+
+
+def get_job_stats() -> dict:
+    """Get job pipeline statistics."""
+    conn = _get_conn()
+    by_status = conn.execute("""
+        SELECT status, COUNT(*) as cnt,
+               SUM(quote_amount) as total_quoted,
+               SUM(final_amount) as total_final
+        FROM jobs GROUP BY status
+    """).fetchall()
+
+    total_revenue = conn.execute(
+        "SELECT SUM(final_amount) FROM jobs WHERE status = 'completed'"
+    ).fetchone()[0] or 0
+
+    total_jobs = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+
+    conn.close()
+    return {
+        "total_jobs": total_jobs,
+        "total_revenue": total_revenue,
+        "by_status": {r["status"]: {
+            "count": r["cnt"],
+            "quoted": r["total_quoted"] or 0,
+            "final": r["total_final"] or 0,
+        } for r in by_status},
+    }

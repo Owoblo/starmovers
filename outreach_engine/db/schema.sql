@@ -23,10 +23,22 @@ CREATE TABLE IF NOT EXISTS contacts (
     bounce_count INTEGER DEFAULT 0,
     bounced_emails TEXT DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    -- CRM account fields
+    company_size TEXT DEFAULT '',
+    company_type TEXT DEFAULT '',
+    confidence_score INTEGER DEFAULT 0,
+    account_status TEXT DEFAULT 'cold',
+    last_touch_date TEXT DEFAULT '',
+    next_action_date TEXT DEFAULT '',
+    next_action TEXT DEFAULT '',
+    decision_maker_found INTEGER DEFAULT 0,
+    procurement_required INTEGER DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_contacts_tier ON contacts(tier);
+CREATE INDEX IF NOT EXISTS idx_contacts_account_status ON contacts(account_status);
 CREATE INDEX IF NOT EXISTS idx_contacts_industry ON contacts(industry_code);
 CREATE INDEX IF NOT EXISTS idx_contacts_email_status ON contacts(email_status);
 CREATE INDEX IF NOT EXISTS idx_contacts_outreach_status ON contacts(outreach_status);
@@ -160,3 +172,75 @@ CREATE TABLE IF NOT EXISTS news_signals (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_url ON news_signals(source_url);
 CREATE INDEX IF NOT EXISTS idx_signals_status ON news_signals(status);
 CREATE INDEX IF NOT EXISTS idx_signals_type ON news_signals(signal_type);
+
+-- Touch log — multi-channel interaction tracking
+CREATE TABLE IF NOT EXISTS touch_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    contact_id INTEGER NOT NULL,
+    channel TEXT NOT NULL,
+    direction TEXT DEFAULT 'outbound',
+    subject TEXT DEFAULT '',
+    notes TEXT DEFAULT '',
+    outcome TEXT DEFAULT '',
+    logged_by TEXT DEFAULT 'system',
+    touch_date TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (contact_id) REFERENCES contacts(id)
+);
+CREATE INDEX IF NOT EXISTS idx_touch_log_contact ON touch_log(contact_id);
+CREATE INDEX IF NOT EXISTS idx_touch_log_channel ON touch_log(channel);
+
+-- Ecosystem contacts — post-move participant capture
+CREATE TABLE IF NOT EXISTS ecosystem_contacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    email TEXT DEFAULT '',
+    phone TEXT DEFAULT '',
+    role TEXT NOT NULL,
+    company TEXT DEFAULT '',
+    source_contact_id INTEGER DEFAULT NULL,
+    notes TEXT DEFAULT '',
+    promoted_contact_id INTEGER DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (source_contact_id) REFERENCES contacts(id)
+);
+CREATE INDEX IF NOT EXISTS idx_ecosystem_role ON ecosystem_contacts(role);
+
+-- Partner codes — partner program with revenue tracking
+CREATE TABLE IF NOT EXISTS partner_codes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    partner_name TEXT NOT NULL,
+    code TEXT NOT NULL UNIQUE,
+    discount_percent REAL DEFAULT 0,
+    bonus_per_referral REAL DEFAULT 0,
+    total_referrals INTEGER DEFAULT 0,
+    total_revenue REAL DEFAULT 0,
+    status TEXT DEFAULT 'active',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_partner_code ON partner_codes(code);
+
+-- Jobs — quote-to-complete revenue pipeline
+CREATE TABLE IF NOT EXISTS jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    contact_id INTEGER DEFAULT NULL,
+    partner_code TEXT DEFAULT '',
+    job_type TEXT DEFAULT 'commercial',
+    status TEXT DEFAULT 'quoted',
+    quote_amount REAL DEFAULT 0,
+    final_amount REAL DEFAULT 0,
+    move_date TEXT DEFAULT '',
+    origin_address TEXT DEFAULT '',
+    destination_address TEXT DEFAULT '',
+    crew_size INTEGER DEFAULT 0,
+    truck_count INTEGER DEFAULT 0,
+    labor_hours REAL DEFAULT 0,
+    notes TEXT DEFAULT '',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (contact_id) REFERENCES contacts(id)
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+CREATE INDEX IF NOT EXISTS idx_jobs_contact ON jobs(contact_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_partner ON jobs(partner_code);

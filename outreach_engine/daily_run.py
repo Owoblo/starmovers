@@ -58,6 +58,21 @@ def _retry(func, max_retries: int = 3, base_delay: float = 5.0, step_name: str =
     raise last_error
 
 
+def step_account_maintenance() -> dict:
+    """Step 0c: Run account maintenance — recalculate confidence, enforce revisits."""
+    logger.info("Step 0c: Running account maintenance...")
+    try:
+        from outreach_engine.account_manager import run_account_maintenance
+        stats = run_account_maintenance()
+        logger.info("  Account maintenance: %d recalced, %d reactivated, %d parked",
+                     stats.get("recalculated", 0), stats.get("reactivated", 0),
+                     stats.get("parked", 0))
+        return stats
+    except Exception as e:
+        logger.warning("  Account maintenance failed: %s", e)
+        return {}
+
+
 def step_discover(limit: int = 60) -> int:
     """Step 1: Discover emails for pending contacts."""
     logger.info("Step 1: Discovering emails (up to %d contacts)...", limit)
@@ -478,6 +493,7 @@ def run_daily_pipeline():
     try:
         step_scan_bounces()
         reply_stats = step_scan_replies()
+        step_account_maintenance()
         discovered = step_discover(cfg.discovery_batch_size)
         generated = step_generate_bundles(cfg.daily_send_target)
         auto_approved = step_auto_approve()
@@ -538,6 +554,7 @@ def run_daily_pipeline_headless(batch_size: int = 20) -> dict:
         "failed": 0,
         "followups": {},
         "news_stats": {},
+        "account_maintenance": {},
         "backup": "",
     }
 
@@ -547,6 +564,9 @@ def run_daily_pipeline_headless(batch_size: int = 20) -> dict:
 
         # Step 0b: Scan replies
         results["reply_stats"] = step_scan_replies()
+
+        # Step 0c: Account maintenance (before discovery so scores are fresh)
+        results["account_maintenance"] = step_account_maintenance()
 
         # Step 1: Send approved bundles first (they've been reviewed or auto-approved)
         results["sent"], results["failed"] = step_send_approved()

@@ -214,6 +214,14 @@ def send_followups(limit: int = 20) -> dict:
             stats["sent"] += 1
             logger.info("Follow-up #%d sent to %s (%s)", seq, email_addr,
                         fu.get("company_name", ""))
+
+            # Hook: park contact to revisit after 3rd touch
+            if seq >= 3:
+                try:
+                    from outreach_engine.account_manager import on_followup_exhausted
+                    on_followup_exhausted(fu["contact_id"])
+                except Exception:
+                    pass
         else:
             stats["failed"] += 1
             logger.warning("Follow-up #%d failed for %s: %s", seq, email_addr,

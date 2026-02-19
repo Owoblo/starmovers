@@ -609,6 +609,13 @@ def process_replies(days: int = 7) -> dict:
             logger.info("Bundle %d (%s): human reply (%s) → status=%s",
                         bid, row["company_name"], sentiment, new_status)
 
+            # Hook: account status transition on reply
+            try:
+                from outreach_engine.account_manager import on_reply_received as _acct_reply
+                _acct_reply(row["contact_id"], sentiment=sentiment, bundle_id=bid)
+            except Exception:
+                pass
+
             # Trigger flywheel for positive/neutral replies
             if sentiment in ("positive", "neutral"):
                 try:

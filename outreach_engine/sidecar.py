@@ -87,6 +87,15 @@ def ensure_db():
     # contacts table migrations
     for col, typedef in [
         ("source_contact_id", "INTEGER DEFAULT NULL"),
+        ("company_size", "TEXT DEFAULT ''"),
+        ("company_type", "TEXT DEFAULT ''"),
+        ("confidence_score", "INTEGER DEFAULT 0"),
+        ("account_status", "TEXT DEFAULT 'cold'"),
+        ("last_touch_date", "TEXT DEFAULT ''"),
+        ("next_action_date", "TEXT DEFAULT ''"),
+        ("next_action", "TEXT DEFAULT ''"),
+        ("decision_maker_found", "INTEGER DEFAULT 0"),
+        ("procurement_required", "INTEGER DEFAULT 0"),
     ]:
         try:
             conn.execute(f"ALTER TABLE contacts ADD COLUMN {col} {typedef}")
@@ -133,6 +142,77 @@ def ensure_db():
         CREATE INDEX IF NOT EXISTS idx_signals_type ON news_signals(signal_type);
     """)
 
+    # CRM tables
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS touch_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contact_id INTEGER NOT NULL,
+            channel TEXT NOT NULL,
+            direction TEXT DEFAULT 'outbound',
+            subject TEXT DEFAULT '',
+            notes TEXT DEFAULT '',
+            outcome TEXT DEFAULT '',
+            logged_by TEXT DEFAULT 'system',
+            touch_date TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (contact_id) REFERENCES contacts(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_touch_log_contact ON touch_log(contact_id);
+        CREATE INDEX IF NOT EXISTS idx_touch_log_channel ON touch_log(channel);
+
+        CREATE TABLE IF NOT EXISTS ecosystem_contacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT DEFAULT '',
+            phone TEXT DEFAULT '',
+            role TEXT NOT NULL,
+            company TEXT DEFAULT '',
+            source_contact_id INTEGER DEFAULT NULL,
+            notes TEXT DEFAULT '',
+            promoted_contact_id INTEGER DEFAULT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (source_contact_id) REFERENCES contacts(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_ecosystem_role ON ecosystem_contacts(role);
+
+        CREATE TABLE IF NOT EXISTS partner_codes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            partner_name TEXT NOT NULL,
+            code TEXT NOT NULL UNIQUE,
+            discount_percent REAL DEFAULT 0,
+            bonus_per_referral REAL DEFAULT 0,
+            total_referrals INTEGER DEFAULT 0,
+            total_revenue REAL DEFAULT 0,
+            status TEXT DEFAULT 'active',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contact_id INTEGER DEFAULT NULL,
+            partner_code TEXT DEFAULT '',
+            job_type TEXT DEFAULT 'commercial',
+            status TEXT DEFAULT 'quoted',
+            quote_amount REAL DEFAULT 0,
+            final_amount REAL DEFAULT 0,
+            move_date TEXT DEFAULT '',
+            origin_address TEXT DEFAULT '',
+            destination_address TEXT DEFAULT '',
+            crew_size INTEGER DEFAULT 0,
+            truck_count INTEGER DEFAULT 0,
+            labor_hours REAL DEFAULT 0,
+            notes TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (contact_id) REFERENCES contacts(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+        CREATE INDEX IF NOT EXISTS idx_jobs_contact ON jobs(contact_id);
+        CREATE INDEX IF NOT EXISTS idx_jobs_partner ON jobs(partner_code);
+        CREATE INDEX IF NOT EXISTS idx_contacts_account_status ON contacts(account_status);
+    """)
+
     conn.commit()
     conn.close()
     logger.info("Database ready at %s", cfg.db_path)
@@ -157,6 +237,60 @@ class DiscoverRequest(BaseModel):
 
 class SnoozeRequest(BaseModel):
     until: str = ""
+
+
+class AccountStatusRequest(BaseModel):
+    status: str
+    notes: str = ""
+
+
+class TouchLogRequest(BaseModel):
+    contact_id: int
+    channel: str
+    direction: str = "outbound"
+    subject: str = ""
+    notes: str = ""
+    outcome: str = ""
+
+
+class EcosystemCreateRequest(BaseModel):
+    name: str
+    email: str = ""
+    phone: str = ""
+    role: str
+    company: str = ""
+    source_contact_id: Optional[int] = None
+    notes: str = ""
+
+
+class PartnerCreateRequest(BaseModel):
+    partner_name: str
+    code: str
+    discount_percent: float = 0
+    bonus_per_referral: float = 0
+
+
+class JobCreateRequest(BaseModel):
+    contact_id: Optional[int] = None
+    partner_code: str = ""
+    job_type: str = "commercial"
+    quote_amount: float = 0
+    move_date: str = ""
+    origin_address: str = ""
+    destination_address: str = ""
+    crew_size: int = 0
+    truck_count: int = 0
+    notes: str = ""
+
+
+class JobUpdateRequest(BaseModel):
+    status: Optional[str] = None
+    final_amount: Optional[float] = None
+    move_date: Optional[str] = None
+    crew_size: Optional[int] = None
+    truck_count: Optional[int] = None
+    labor_hours: Optional[float] = None
+    notes: Optional[str] = None
 
 
 # ── Pipeline endpoints ──
@@ -300,6 +434,12 @@ def _send_single_bundle(bundle_id: int) -> dict:
 
     if email_sent:
         queue_manager.mark_sent(bundle_id, email_sent=True)
+        # Hook: account status transition on send
+        try:
+            from outreach_engine.account_manager import on_email_sent
+            on_email_sent(bundle.get("contact_id", 0), bundle_id)
+        except Exception:
+            pass
 
     return {
         "bundle_id": bundle_id,
@@ -570,10 +710,19 @@ def track_open(tracking_id: str, request: Request, background_tasks: BackgroundT
     ip = request.client.host if request.client else ""
     ua = request.headers.get("user-agent", "")
     result = queue_manager.record_email_open(tracking_id, ip_address=ip, user_agent=ua)
-    # Trigger flywheel on first open
+    # Trigger flywheel + account status on first open
     if result and result.get("first_open"):
         from outreach_engine.flywheel import on_email_opened
         background_tasks.add_task(on_email_opened, result["bundle_id"])
+        # Hook: account status transition on open
+        try:
+            from outreach_engine.account_manager import on_email_opened as _acct_opened
+            bid = result["bundle_id"]
+            b = queue_manager.get_bundle(bid)
+            if b:
+                background_tasks.add_task(_acct_opened, b["contact_id"], bid)
+        except Exception:
+            pass
     return Response(
         content=TRACKING_PIXEL,
         media_type="image/gif",
@@ -805,6 +954,194 @@ def list_relocations():
     """).fetchall()
     conn.close()
     return {"relocations": [dict(r) for r in rows]}
+
+
+# ── Account Board ──
+
+@app.get("/api/accounts/board")
+def get_account_board(status: Optional[str] = None, limit: int = 100,
+                      offset: int = 0):
+    """Get account board — contacts grouped by account status."""
+    accounts = queue_manager.get_account_board(status, limit, offset)
+    return {"accounts": accounts, "count": len(accounts)}
+
+
+@app.get("/api/accounts/board/stats")
+def get_account_board_stats():
+    """Get account board summary statistics."""
+    return queue_manager.get_account_board_stats()
+
+
+@app.get("/api/accounts/{contact_id}")
+def get_account_detail(contact_id: int):
+    """Get full account detail including touches, bundles, jobs."""
+    detail = queue_manager.get_account_detail(contact_id)
+    if not detail:
+        raise HTTPException(status_code=404, detail="Contact not found")
+    return detail
+
+
+@app.post("/api/accounts/{contact_id}/status")
+def update_account_status(contact_id: int, req: AccountStatusRequest):
+    """Update account status with transition validation."""
+    from outreach_engine.account_manager import transition_account_status
+    result = transition_account_status(contact_id, req.status, notes=req.notes)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Transition failed"))
+    return result
+
+
+@app.post("/api/accounts/{contact_id}/dnc")
+def mark_account_dnc(contact_id: int, req: AccountStatusRequest):
+    """Mark account as DNC (permanent)."""
+    from outreach_engine.account_manager import mark_dnc
+    result = mark_dnc(contact_id, reason=req.notes)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "DNC failed"))
+    return result
+
+
+@app.post("/api/accounts/{contact_id}/confidence/recalculate")
+def recalculate_confidence(contact_id: int):
+    """Recalculate confidence score for a single contact."""
+    from outreach_engine.account_manager import compute_confidence_score
+    score = compute_confidence_score(contact_id)
+    return {"contact_id": contact_id, "confidence_score": score}
+
+
+# ── Touch Log ──
+
+@app.post("/api/touches/log")
+def log_touch(req: TouchLogRequest):
+    """Log a multi-channel touch (email, phone, in_person, etc)."""
+    tid = queue_manager.log_touch(
+        contact_id=req.contact_id, channel=req.channel,
+        direction=req.direction, subject=req.subject,
+        notes=req.notes, outcome=req.outcome,
+    )
+    return {"id": tid, "status": "logged"}
+
+
+@app.get("/api/touches/stats")
+def get_touch_stats():
+    """Get touch statistics across all contacts."""
+    return queue_manager.get_touch_stats()
+
+
+@app.get("/api/touches/{contact_id}")
+def get_touches(contact_id: int, limit: int = 50):
+    """Get touch log for a contact."""
+    touches = queue_manager.get_touches(contact_id, limit)
+    return {"touches": touches, "count": len(touches)}
+
+
+# ── Ecosystem Contacts ──
+
+@app.post("/api/ecosystem/create")
+def create_ecosystem_contact(req: EcosystemCreateRequest):
+    """Create an ecosystem contact (realtor, lawyer, broker, etc)."""
+    eid = queue_manager.create_ecosystem_contact(
+        name=req.name, role=req.role, email=req.email,
+        phone=req.phone, company=req.company,
+        source_contact_id=req.source_contact_id, notes=req.notes,
+    )
+    return {"id": eid, "status": "created"}
+
+
+@app.get("/api/ecosystem/list")
+def list_ecosystem_contacts(role: Optional[str] = None,
+                            limit: int = 50, offset: int = 0):
+    """List ecosystem contacts with optional role filter."""
+    contacts = queue_manager.get_ecosystem_contacts(role, limit, offset)
+    return {"contacts": contacts, "count": len(contacts)}
+
+
+@app.post("/api/ecosystem/{ecosystem_id}/promote")
+def promote_ecosystem(ecosystem_id: int):
+    """Promote ecosystem contact to full CRM contact."""
+    new_id = queue_manager.promote_ecosystem_contact(ecosystem_id)
+    if not new_id:
+        raise HTTPException(status_code=404, detail="Ecosystem contact not found")
+    return {"ecosystem_id": ecosystem_id, "new_contact_id": new_id, "status": "promoted"}
+
+
+# ── Partner Codes ──
+
+@app.post("/api/partners/create")
+def create_partner(req: PartnerCreateRequest):
+    """Create a partner code."""
+    pid = queue_manager.create_partner_code(
+        partner_name=req.partner_name, code=req.code,
+        discount_percent=req.discount_percent,
+        bonus_per_referral=req.bonus_per_referral,
+    )
+    return {"id": pid, "code": req.code.upper(), "status": "created"}
+
+
+@app.get("/api/partners/list")
+def list_partners(status: str = "active", limit: int = 50):
+    """List partner codes."""
+    partners = queue_manager.get_partner_codes(status, limit)
+    return {"partners": partners, "count": len(partners)}
+
+
+@app.get("/api/partners/lookup/{code}")
+def lookup_partner(code: str):
+    """Look up a partner code."""
+    partner = queue_manager.lookup_partner_code(code)
+    if not partner:
+        raise HTTPException(status_code=404, detail="Partner code not found")
+    return partner
+
+
+# ── Jobs ──
+
+@app.post("/api/jobs/create")
+def create_job(req: JobCreateRequest):
+    """Create a job (quote → book → complete pipeline)."""
+    jid = queue_manager.create_job(
+        contact_id=req.contact_id, partner_code=req.partner_code,
+        job_type=req.job_type, quote_amount=req.quote_amount,
+        move_date=req.move_date, origin_address=req.origin_address,
+        destination_address=req.destination_address,
+        crew_size=req.crew_size, truck_count=req.truck_count,
+        notes=req.notes,
+    )
+    return {"id": jid, "status": "quoted"}
+
+
+@app.get("/api/jobs/list")
+def list_jobs(status: Optional[str] = None, limit: int = 50, offset: int = 0):
+    """List jobs with optional status filter."""
+    jobs = queue_manager.get_jobs(status, limit, offset)
+    return {"jobs": jobs, "count": len(jobs)}
+
+
+@app.get("/api/jobs/stats")
+def get_job_stats():
+    """Get job pipeline statistics."""
+    return queue_manager.get_job_stats()
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job(job_id: int):
+    """Get a single job with contact info."""
+    job = queue_manager.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
+@app.post("/api/jobs/{job_id}/update")
+def update_job(job_id: int, req: JobUpdateRequest):
+    """Update a job (status, amounts, crew, etc)."""
+    kwargs = {k: v for k, v in req.model_dump().items() if v is not None}
+    if not kwargs:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    success = queue_manager.update_job(job_id, **kwargs)
+    if not success:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"job_id": job_id, "status": "updated", "fields": list(kwargs.keys())}
 
 
 # ── Flywheel ──
@@ -1218,6 +1555,17 @@ def _scheduled_flywheel():
         logger.exception("SCHEDULER: Flywheel failed")
 
 
+def _scheduled_account_maintenance():
+    """Scheduled task: recalculate confidence, enforce revisits."""
+    logger.info("SCHEDULER: Starting account maintenance...")
+    try:
+        from outreach_engine.account_manager import run_account_maintenance
+        stats = run_account_maintenance()
+        logger.info("SCHEDULER: Account maintenance complete — %s", stats)
+    except Exception:
+        logger.exception("SCHEDULER: Account maintenance failed")
+
+
 def _init_scheduler():
     """Initialize APScheduler with all scheduled tasks."""
     global _scheduler, _scheduler_running
@@ -1277,12 +1625,22 @@ def _init_scheduler():
             misfire_grace_time=3600,
         )
 
+        # Account maintenance — runs daily at configured hour (default 8am)
+        _scheduler.add_job(
+            _scheduled_account_maintenance,
+            CronTrigger(hour=cfg.account_maintenance_hour, minute=0),
+            id="account_maintenance",
+            name="Account Maintenance",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+
         _scheduler.start()
         _scheduler_running = True
-        logger.info("SCHEDULER: Started with 5 jobs — pipeline @%dh, followups @%dh, "
-                     "backup @%dh, flywheel every 6h, news scan @7h+14h",
-                     cfg.pipeline_schedule_hour, cfg.followup_schedule_hour,
-                     cfg.backup_schedule_hour)
+        logger.info("SCHEDULER: Started with 6 jobs — acct maint @%dh, pipeline @%dh, "
+                     "followups @%dh, backup @%dh, flywheel every 6h, news scan @7h+14h",
+                     cfg.account_maintenance_hour, cfg.pipeline_schedule_hour,
+                     cfg.followup_schedule_hour, cfg.backup_schedule_hour)
     except Exception:
         logger.exception("SCHEDULER: Failed to initialize — running without scheduler")
         _scheduler_running = False
@@ -1357,6 +1715,7 @@ def trigger_job(job_id: str, background_tasks: BackgroundTasks):
         "db_backup": _scheduled_backup,
         "flywheel": _scheduled_flywheel,
         "news_scanner": _scheduled_news_scan,
+        "account_maintenance": _scheduled_account_maintenance,
     }
     if job_id not in job_map:
         raise HTTPException(status_code=404,
