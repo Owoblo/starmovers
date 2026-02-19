@@ -1340,3 +1340,95 @@ def get_job_stats() -> dict:
             "final": r["total_final"] or 0,
         } for r in by_status},
     }
+
+
+# ── Field Intel / Account Research CRUD ──
+
+
+def submit_idea(company_name: str, user_notes: str = "",
+                city: str = "Windsor-Essex", industry: str = "",
+                priority: str = "medium") -> int:
+    """Submit a field intel idea. Returns idea id."""
+    conn = _get_conn()
+    cur = conn.execute("""
+        INSERT INTO account_research (company_name, user_notes, city,
+                                      industry, priority, research_status)
+        VALUES (?, ?, ?, ?, ?, 'new')
+    """, (company_name, user_notes, city, industry, priority))
+    idea_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return idea_id
+
+
+def get_ideas(status: Optional[str] = None, limit: int = 50,
+              offset: int = 0) -> list[dict]:
+    """List field intel ideas with optional status filter."""
+    conn = _get_conn()
+    if status:
+        rows = conn.execute("""
+            SELECT * FROM account_research WHERE research_status = ?
+            ORDER BY
+                CASE priority WHEN 'urgent' THEN 1 WHEN 'high' THEN 2
+                     WHEN 'medium' THEN 3 ELSE 4 END,
+                created_at DESC
+            LIMIT ? OFFSET ?
+        """, (status, limit, offset)).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT * FROM account_research
+            ORDER BY
+                CASE research_status
+                    WHEN 'active' THEN 1 WHEN 'staged' THEN 2
+                    WHEN 'researched' THEN 3 WHEN 'researching' THEN 4
+                    WHEN 'new' THEN 5 WHEN 'completed' THEN 6
+                    ELSE 7 END,
+                CASE priority WHEN 'urgent' THEN 1 WHEN 'high' THEN 2
+                     WHEN 'medium' THEN 3 ELSE 4 END,
+                created_at DESC
+            LIMIT ? OFFSET ?
+        """, (limit, offset)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_idea(idea_id: int) -> Optional[dict]:
+    """Get a single field intel idea with full detail."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM account_research WHERE id = ?", (idea_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    result = dict(row)
+    # Parse JSON fields for convenience
+    import json
+    for field in ("angles", "target_contacts", "stages_json"):
+        try:
+            result[field] = json.loads(result.get(field) or "[]")
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return result
+
+
+def update_idea_notes(idea_id: int, notes: str) -> bool:
+    """Append additional notes to an idea (field intel updates)."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT user_notes FROM account_research WHERE id = ?", (idea_id,)
+    ).fetchone()
+    if not row:
+        conn.close()
+        return False
+
+    existing = row["user_notes"] or ""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    updated = f"{existing}\n[{ts}] {notes}" if existing else f"[{ts}] {notes}"
+
+    conn.execute(
+        "UPDATE account_research SET user_notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (updated, idea_id))
+    conn.commit()
+    conn.close()
+    return True

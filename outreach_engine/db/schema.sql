@@ -244,3 +244,29 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_contact ON jobs(contact_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_partner ON jobs(partner_code);
+
+-- Field Intel — research pipeline for companies spotted in the field
+CREATE TABLE IF NOT EXISTS account_research (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    company_name TEXT NOT NULL,
+    user_notes TEXT DEFAULT '',
+    research_status TEXT DEFAULT 'new',
+    company_brief TEXT DEFAULT '',
+    company_type TEXT DEFAULT '',
+    approach_strategy TEXT DEFAULT '',
+    angles TEXT DEFAULT '[]',
+    procurement_notes TEXT DEFAULT '',
+    target_contacts TEXT DEFAULT '[]',
+    recommended_first_message TEXT DEFAULT '',
+    stages_json TEXT DEFAULT '[]',
+    current_stage INTEGER DEFAULT 0,
+    contact_id INTEGER DEFAULT NULL,
+    city TEXT DEFAULT '',
+    industry TEXT DEFAULT '',
+    priority TEXT DEFAULT 'medium',
+    next_action_date TEXT DEFAULT '',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_research_status ON account_research(research_status);
+CREATE INDEX IF NOT EXISTS idx_research_priority ON account_research(priority);

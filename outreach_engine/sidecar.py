@@ -211,6 +211,31 @@ def ensure_db():
         CREATE INDEX IF NOT EXISTS idx_jobs_contact ON jobs(contact_id);
         CREATE INDEX IF NOT EXISTS idx_jobs_partner ON jobs(partner_code);
         CREATE INDEX IF NOT EXISTS idx_contacts_account_status ON contacts(account_status);
+
+        CREATE TABLE IF NOT EXISTS account_research (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            company_name TEXT NOT NULL,
+            user_notes TEXT DEFAULT '',
+            research_status TEXT DEFAULT 'new',
+            company_brief TEXT DEFAULT '',
+            company_type TEXT DEFAULT '',
+            approach_strategy TEXT DEFAULT '',
+            angles TEXT DEFAULT '[]',
+            procurement_notes TEXT DEFAULT '',
+            target_contacts TEXT DEFAULT '[]',
+            recommended_first_message TEXT DEFAULT '',
+            stages_json TEXT DEFAULT '[]',
+            current_stage INTEGER DEFAULT 0,
+            contact_id INTEGER DEFAULT NULL,
+            city TEXT DEFAULT '',
+            industry TEXT DEFAULT '',
+            priority TEXT DEFAULT 'medium',
+            next_action_date TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_research_status ON account_research(research_status);
+        CREATE INDEX IF NOT EXISTS idx_research_priority ON account_research(priority);
     """)
 
     conn.commit()
@@ -291,6 +316,27 @@ class JobUpdateRequest(BaseModel):
     truck_count: Optional[int] = None
     labor_hours: Optional[float] = None
     notes: Optional[str] = None
+
+
+class IdeaSubmitRequest(BaseModel):
+    company_name: str
+    user_notes: str = ""
+    city: str = "Windsor-Essex"
+    industry: str = ""
+    priority: str = "medium"
+    auto_research: bool = True
+
+
+class IdeaNotesRequest(BaseModel):
+    notes: str
+
+
+class IdeaContactRequest(BaseModel):
+    contact_name: str = ""
+    title_role: str = ""
+    email: str = ""
+    phone: str = ""
+    website: str = ""
 
 
 # ── Pipeline endpoints ──
@@ -1142,6 +1188,94 @@ def update_job(job_id: int, req: JobUpdateRequest):
     if not success:
         raise HTTPException(status_code=404, detail="Job not found")
     return {"job_id": job_id, "status": "updated", "fields": list(kwargs.keys())}
+
+
+# ── Field Intel ──
+
+@app.post("/api/ideas/submit")
+def submit_idea(req: IdeaSubmitRequest, background_tasks: BackgroundTasks):
+    """Submit a field intel idea. Optionally auto-triggers GPT research."""
+    idea_id = queue_manager.submit_idea(
+        company_name=req.company_name, user_notes=req.user_notes,
+        city=req.city, industry=req.industry, priority=req.priority,
+    )
+    result = {"id": idea_id, "status": "submitted", "company": req.company_name}
+
+    if req.auto_research:
+        from outreach_engine.research_engine import research_company
+        background_tasks.add_task(research_company, idea_id)
+        result["research"] = "started"
+
+    return result
+
+
+@app.get("/api/ideas/list")
+def list_ideas(status: Optional[str] = None, limit: int = 50, offset: int = 0):
+    """List field intel ideas."""
+    ideas = queue_manager.get_ideas(status, limit, offset)
+    return {"ideas": ideas, "count": len(ideas)}
+
+
+@app.get("/api/ideas/{idea_id}")
+def get_idea(idea_id: int):
+    """Get full detail for a field intel idea including research + stages."""
+    idea = queue_manager.get_idea(idea_id)
+    if not idea:
+        raise HTTPException(status_code=404, detail="Idea not found")
+    return idea
+
+
+@app.post("/api/ideas/{idea_id}/research")
+def trigger_research(idea_id: int, background_tasks: BackgroundTasks):
+    """Trigger or re-trigger GPT research for an idea."""
+    idea = queue_manager.get_idea(idea_id)
+    if not idea:
+        raise HTTPException(status_code=404, detail="Idea not found")
+    from outreach_engine.research_engine import research_company
+    background_tasks.add_task(research_company, idea_id)
+    return {"id": idea_id, "status": "research_started"}
+
+
+@app.post("/api/ideas/{idea_id}/add-notes")
+def add_idea_notes(idea_id: int, req: IdeaNotesRequest):
+    """Add additional field intel notes to an idea."""
+    success = queue_manager.update_idea_notes(idea_id, req.notes)
+    if not success:
+        raise HTTPException(status_code=404, detail="Idea not found")
+    return {"id": idea_id, "status": "notes_added"}
+
+
+@app.post("/api/ideas/{idea_id}/approve-stage")
+def approve_stage(idea_id: int, req: IdeaNotesRequest):
+    """Approve/advance the current stage of a field intel idea."""
+    from outreach_engine.research_engine import advance_stage
+    result = advance_stage(idea_id, notes=req.notes)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("error", "Failed"))
+    return result
+
+
+@app.post("/api/ideas/{idea_id}/generate-outreach")
+def generate_idea_outreach(idea_id: int):
+    """Generate custom outreach email for the current stage."""
+    from outreach_engine.research_engine import generate_stage_outreach
+    result = generate_stage_outreach(idea_id)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@app.post("/api/ideas/{idea_id}/create-contact")
+def create_contact_from_idea(idea_id: int, req: IdeaContactRequest):
+    """Create a CRM contact from a researched idea."""
+    from outreach_engine.research_engine import create_contact_from_research
+    contact_id = create_contact_from_research(
+        idea_id, contact_name=req.contact_name, title_role=req.title_role,
+        email=req.email, phone=req.phone, website=req.website,
+    )
+    if not contact_id:
+        raise HTTPException(status_code=400, detail="Could not create contact")
+    return {"idea_id": idea_id, "contact_id": contact_id, "status": "contact_created"}
 
 
 # ── Flywheel ──

@@ -613,6 +613,13 @@ ACCOUNT MAINTENANCE:
     attention_detail = _build_needs_attention_section()
     board_summary = _build_account_board_summary()
 
+    # Build field intel section
+    try:
+        from outreach_engine.research_engine import get_research_summary_for_report
+        field_intel_detail = get_research_summary_for_report()
+    except Exception:
+        field_intel_detail = "  (field intel module not available)\n"
+
     body = f"""Saturn Star Movers — Daily Pipeline Report
 {'=' * 55}
 Date: {today}
@@ -640,6 +647,10 @@ QUEUED FOR TOMORROW — Ready to Send
 ACCOUNT BOARD
 {'─' * 55}
 {board_summary}
+{'─' * 55}
+FIELD INTEL — Research Pipeline
+{'─' * 55}
+{field_intel_detail}
 {'─' * 55}
 PIPELINE TOTALS (all time)
 {'─' * 55}
