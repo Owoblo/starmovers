@@ -234,6 +234,13 @@ IMPORTANT:
                 company, research.get("company_type"),
                 research.get("approach_strategy"), len(stages))
 
+    # Telegram notification hook
+    try:
+        from outreach_engine.telegram_notifications import notify_research_complete
+        notify_research_complete(idea_id, company, research)
+    except Exception as e:
+        logger.debug("Telegram notification skipped: %s", e)
+
     return research
 
 

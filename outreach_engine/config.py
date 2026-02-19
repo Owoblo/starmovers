@@ -99,6 +99,15 @@ class _Config:
         "recent_activity": 10,
     }
 
+    # Telegram Bot
+    telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
+    telegram_setup_token: str = os.getenv("TELEGRAM_SETUP_TOKEN", "")
+    telegram_webhook_secret: str = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
+    telegram_group_timeout: int = int(os.getenv("TELEGRAM_GROUP_TIMEOUT", "300"))
+    telegram_research_hours: str = os.getenv("TELEGRAM_RESEARCH_HOURS", "9,15")
+    telegram_daily_summary_hour: int = int(os.getenv("TELEGRAM_DAILY_SUMMARY_HOUR", "20"))
+
     # Confidence routing thresholds
     confidence_auto_threshold: int = int(os.getenv("CONFIDENCE_AUTO_THRESHOLD", "70"))
     confidence_manual_threshold: int = int(os.getenv("CONFIDENCE_MANUAL_THRESHOLD", "40"))

@@ -238,6 +238,34 @@ def ensure_db():
         CREATE INDEX IF NOT EXISTS idx_research_priority ON account_research(priority);
     """)
 
+    # Telegram tables
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS telegram_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            telegram_msg_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            raw_text TEXT NOT NULL,
+            parsed_json TEXT DEFAULT '{}',
+            intent TEXT DEFAULT '',
+            company_name TEXT DEFAULT '',
+            group_id TEXT DEFAULT '',
+            idea_id INTEGER DEFAULT NULL,
+            processed INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS telegram_notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            notification_type TEXT NOT NULL,
+            reference_id INTEGER DEFAULT NULL,
+            message_text TEXT DEFAULT '',
+            sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_tg_notif_chat ON telegram_notifications(chat_id);
+        CREATE INDEX IF NOT EXISTS idx_tg_notif_type ON telegram_notifications(notification_type);
+    """)
+
     conn.commit()
     conn.close()
     logger.info("Database ready at %s", cfg.db_path)
@@ -1278,6 +1306,39 @@ def create_contact_from_idea(idea_id: int, req: IdeaContactRequest):
     return {"idea_id": idea_id, "contact_id": contact_id, "status": "contact_created"}
 
 
+# ── Telegram Bot Webhook ──
+
+@app.post("/api/telegram/webhook")
+async def telegram_webhook(request: Request):
+    """Receive webhook updates from Telegram Bot API."""
+    # Verify secret token if configured
+    if cfg.telegram_webhook_secret:
+        header_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if header_secret != cfg.telegram_webhook_secret:
+            raise HTTPException(status_code=403, detail="Invalid secret token")
+
+    try:
+        update = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    from outreach_engine.telegram_bot import handle_update
+    result = await handle_update(update)
+    return result
+
+
+@app.post("/api/telegram/setup-webhook")
+async def setup_telegram_webhook():
+    """Register webhook URL with Telegram (call once after deploy)."""
+    if not cfg.telegram_bot_token:
+        raise HTTPException(status_code=400, detail="TELEGRAM_BOT_TOKEN not configured")
+
+    webhook_url = f"{cfg.sidecar_public_url}/api/telegram/webhook"
+    from outreach_engine.telegram_bot import setup_webhook
+    result = await setup_webhook(webhook_url)
+    return {"webhook_url": webhook_url, "telegram_response": result}
+
+
 # ── Flywheel ──
 
 @app.post("/api/flywheel/run")
@@ -1700,6 +1761,45 @@ def _scheduled_account_maintenance():
         logger.exception("SCHEDULER: Account maintenance failed")
 
 
+def _scheduled_telegram_group_flush():
+    """Scheduled task: flush stale Telegram message groups (every 60s)."""
+    try:
+        from outreach_engine.telegram_bot import flush_and_submit_groups
+        flush_and_submit_groups()
+    except Exception:
+        logger.exception("SCHEDULER: Telegram group flush failed")
+
+
+def _scheduled_telegram_batch_research():
+    """Scheduled task: research all queued (non-urgent) Telegram ideas."""
+    logger.info("SCHEDULER: Starting Telegram batch research...")
+    try:
+        from outreach_engine.telegram_bot import run_batch_research
+        run_batch_research()
+    except Exception:
+        logger.exception("SCHEDULER: Telegram batch research failed")
+
+
+def _scheduled_telegram_daily_summary():
+    """Scheduled task: send daily summary to Telegram (8pm)."""
+    logger.info("SCHEDULER: Sending Telegram daily summary...")
+    try:
+        from outreach_engine.telegram_notifications import send_daily_summary
+        send_daily_summary()
+    except Exception:
+        logger.exception("SCHEDULER: Telegram daily summary failed")
+
+
+def _scheduled_telegram_stuck_stages():
+    """Scheduled task: check for stuck ideas and ping owner."""
+    logger.info("SCHEDULER: Checking for stuck stages...")
+    try:
+        from outreach_engine.telegram_notifications import check_stuck_stages
+        check_stuck_stages()
+    except Exception:
+        logger.exception("SCHEDULER: Stuck-stage check failed")
+
+
 def _init_scheduler():
     """Initialize APScheduler with all scheduled tasks."""
     global _scheduler, _scheduler_running
@@ -1769,10 +1869,58 @@ def _init_scheduler():
             misfire_grace_time=3600,
         )
 
+        # Telegram: flush stale message groups every 60 seconds
+        if cfg.telegram_bot_token:
+            from apscheduler.triggers.interval import IntervalTrigger
+
+            _scheduler.add_job(
+                _scheduled_telegram_group_flush,
+                IntervalTrigger(seconds=60),
+                id="telegram_group_flush",
+                name="Telegram Group Flush",
+                replace_existing=True,
+            )
+
+            # Telegram: batch research at configured hours (default 9am + 3pm)
+            research_hours = cfg.telegram_research_hours  # e.g. "9,15"
+            _scheduler.add_job(
+                _scheduled_telegram_batch_research,
+                CronTrigger(hour=research_hours, minute=0),
+                id="telegram_batch_research",
+                name="Telegram Batch Research",
+                replace_existing=True,
+                misfire_grace_time=3600,
+            )
+
+            # Telegram: daily summary push (default 8pm)
+            _scheduler.add_job(
+                _scheduled_telegram_daily_summary,
+                CronTrigger(hour=cfg.telegram_daily_summary_hour, minute=0),
+                id="telegram_daily_summary",
+                name="Telegram Daily Summary",
+                replace_existing=True,
+                misfire_grace_time=3600,
+            )
+
+            # Telegram: stuck-stage checker every 4 hours (10am, 2pm, 6pm)
+            _scheduler.add_job(
+                _scheduled_telegram_stuck_stages,
+                CronTrigger(hour="10,14,18", minute=0),
+                id="telegram_stuck_stages",
+                name="Telegram Stuck Stage Checker",
+                replace_existing=True,
+                misfire_grace_time=3600,
+            )
+            logger.info("SCHEDULER: Telegram jobs added — group flush @60s, "
+                         "batch research @%sh, daily summary @%dh, "
+                         "stuck-stage check @10h+14h+18h",
+                         research_hours, cfg.telegram_daily_summary_hour)
+
         _scheduler.start()
         _scheduler_running = True
-        logger.info("SCHEDULER: Started with 6 jobs — acct maint @%dh, pipeline @%dh, "
+        logger.info("SCHEDULER: Started with %d jobs — acct maint @%dh, pipeline @%dh, "
                      "followups @%dh, backup @%dh, flywheel every 6h, news scan @7h+14h",
+                     len(_scheduler.get_jobs()),
                      cfg.account_maintenance_hour, cfg.pipeline_schedule_hour,
                      cfg.followup_schedule_hour, cfg.backup_schedule_hour)
     except Exception:
@@ -1850,6 +1998,10 @@ def trigger_job(job_id: str, background_tasks: BackgroundTasks):
         "flywheel": _scheduled_flywheel,
         "news_scanner": _scheduled_news_scan,
         "account_maintenance": _scheduled_account_maintenance,
+        "telegram_group_flush": _scheduled_telegram_group_flush,
+        "telegram_batch_research": _scheduled_telegram_batch_research,
+        "telegram_daily_summary": _scheduled_telegram_daily_summary,
+        "telegram_stuck_stages": _scheduled_telegram_stuck_stages,
     }
     if job_id not in job_map:
         raise HTTPException(status_code=404,
