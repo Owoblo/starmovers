@@ -74,6 +74,10 @@ class _Config:
     followup_schedule_hour: int = int(os.getenv("FOLLOWUP_HOUR", "11"))
     backup_schedule_hour: int = int(os.getenv("BACKUP_HOUR", "0"))
 
+    # News Scanner
+    news_scan_enabled: bool = os.getenv("NEWS_SCAN_ENABLED", "true").lower() == "true"
+    news_scan_max_daily: int = int(os.getenv("NEWS_SCAN_MAX_DAILY", "50"))
+
     # DB backup
     backup_dir: Path = (
         _DATA_DIR / "backups" if _DATA_DIR and _DATA_DIR.is_dir()

@@ -108,6 +108,31 @@ def ensure_db():
         CREATE INDEX IF NOT EXISTS idx_pipeline_runs_status ON pipeline_runs(status);
     """)
 
+    # news_signals table
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS news_signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_name TEXT NOT NULL,
+            source_url TEXT NOT NULL,
+            headline TEXT DEFAULT '',
+            content_snippet TEXT DEFAULT '',
+            signal_type TEXT NOT NULL,
+            company_name TEXT DEFAULT '',
+            opportunity TEXT DEFAULT '',
+            city TEXT DEFAULT '',
+            urgency TEXT DEFAULT 'medium',
+            recommended_action TEXT DEFAULT '',
+            contact_id INTEGER DEFAULT NULL,
+            status TEXT DEFAULT 'new',
+            published_date TEXT DEFAULT '',
+            scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_url ON news_signals(source_url);
+        CREATE INDEX IF NOT EXISTS idx_signals_status ON news_signals(status);
+        CREATE INDEX IF NOT EXISTS idx_signals_type ON news_signals(signal_type);
+    """)
+
     conn.commit()
     conn.close()
     logger.info("Database ready at %s", cfg.db_path)
@@ -615,6 +640,97 @@ def add_donor_source(req: DonorSourceRequest):
     return {"status": "added", "name": req.name, "url": req.url}
 
 
+# ── News Signal Scanner ──
+
+_news_scan_progress: dict = {"running": False, "done": False, "results": {}}
+
+
+@app.post("/api/news/scan", status_code=202)
+def trigger_news_scan(background_tasks: BackgroundTasks, dry_run: bool = False):
+    """Trigger a news signal scan."""
+    global _news_scan_progress
+    if _news_scan_progress.get("running"):
+        raise HTTPException(status_code=409, detail="News scan already running")
+    _news_scan_progress = {"running": True, "done": False, "results": {}}
+    background_tasks.add_task(_news_scan_task, not dry_run)
+    return {"status": "started", "auto_create_contacts": not dry_run}
+
+
+def _news_scan_task(auto_create: bool = True):
+    global _news_scan_progress
+    try:
+        from outreach_engine.news_scanner import scan_all_sources
+        _news_scan_progress["results"] = scan_all_sources(
+            auto_create_contacts=auto_create,
+        )
+    except Exception:
+        logger.exception("News scan failed")
+        _news_scan_progress["results"] = {"error": "News scan failed"}
+    finally:
+        _news_scan_progress["done"] = True
+        _news_scan_progress["running"] = False
+
+
+@app.get("/api/news/scan/status")
+def news_scan_status():
+    return _news_scan_progress
+
+
+@app.get("/api/news/signals")
+def list_news_signals(status: Optional[str] = None, signal_type: Optional[str] = None,
+                      limit: int = 50, offset: int = 0):
+    """List news signals with optional filters."""
+    signals = queue_manager.get_news_signals(status, signal_type, limit, offset)
+    return {"signals": signals, "count": len(signals)}
+
+
+@app.get("/api/news/signals/{signal_id}")
+def get_news_signal(signal_id: int):
+    """Get a single news signal."""
+    signal = queue_manager.get_news_signal(signal_id)
+    if not signal:
+        raise HTTPException(status_code=404, detail="Signal not found")
+    return signal
+
+
+@app.post("/api/news/signals/{signal_id}/create-contact")
+def create_contact_from_signal(signal_id: int):
+    """Create a contact from a news signal and kick off discovery."""
+    from outreach_engine.news_scanner import create_contact_from_signal as _create
+    contact_id = _create(signal_id)
+    if not contact_id:
+        raise HTTPException(status_code=400,
+                            detail="Could not create contact (no company name or already exists)")
+
+    # Trigger email discovery for the new contact
+    email_found = ""
+    try:
+        email_found, _ = discover_email(contact_id)
+    except Exception as e:
+        logger.warning("Discovery failed for news signal contact #%d: %s", contact_id, e)
+
+    return {
+        "contact_id": contact_id,
+        "signal_id": signal_id,
+        "email_found": email_found,
+        "status": "created",
+    }
+
+
+@app.post("/api/news/signals/{signal_id}/dismiss")
+def dismiss_signal(signal_id: int):
+    """Dismiss a news signal."""
+    queue_manager.update_news_signal_status(signal_id, "dismissed")
+    return {"status": "dismissed", "signal_id": signal_id}
+
+
+@app.get("/api/news/stats")
+def news_signal_stats():
+    """Get news signal statistics."""
+    from outreach_engine.news_scanner import get_signal_stats
+    return get_signal_stats()
+
+
 # ── Corporate Relocation ──
 
 class RelocationRequest(BaseModel):
@@ -1079,6 +1195,18 @@ def _scheduled_backup():
         logger.exception("SCHEDULER: Backup failed")
 
 
+def _scheduled_news_scan():
+    """Scheduled task: scan local news for business signals."""
+    logger.info("SCHEDULER: Starting news signal scan...")
+    try:
+        from outreach_engine.news_scanner import scan_all_sources
+        stats = scan_all_sources(auto_create_contacts=True)
+        logger.info("SCHEDULER: News scan complete — %d signals, %d contacts",
+                     stats.get("total_signals", 0), stats.get("total_contacts_created", 0))
+    except Exception:
+        logger.exception("SCHEDULER: News scan failed")
+
+
 def _scheduled_flywheel():
     """Scheduled task: run flywheel for contact growth."""
     logger.info("SCHEDULER: Starting flywheel...")
@@ -1139,10 +1267,20 @@ def _init_scheduler():
             misfire_grace_time=3600,
         )
 
+        # News scanner — runs 2x/day (7am and 2pm)
+        _scheduler.add_job(
+            _scheduled_news_scan,
+            CronTrigger(hour="7,14", minute=0),
+            id="news_scanner",
+            name="News Signal Scanner",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+
         _scheduler.start()
         _scheduler_running = True
-        logger.info("SCHEDULER: Started with 4 jobs — pipeline @%dh, followups @%dh, "
-                     "backup @%dh, flywheel every 6h",
+        logger.info("SCHEDULER: Started with 5 jobs — pipeline @%dh, followups @%dh, "
+                     "backup @%dh, flywheel every 6h, news scan @7h+14h",
                      cfg.pipeline_schedule_hour, cfg.followup_schedule_hour,
                      cfg.backup_schedule_hour)
     except Exception:
@@ -1218,6 +1356,7 @@ def trigger_job(job_id: str, background_tasks: BackgroundTasks):
         "followup_cycle": _scheduled_followups,
         "db_backup": _scheduled_backup,
         "flywheel": _scheduled_flywheel,
+        "news_scanner": _scheduled_news_scan,
     }
     if job_id not in job_map:
         raise HTTPException(status_code=404,

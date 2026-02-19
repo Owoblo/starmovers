@@ -343,7 +343,8 @@ def step_followups() -> dict:
 
 def step_notify(discovered: int, generated: int, sent: int,
                 reply_stats: dict | None = None, failed: int = 0,
-                auto_approved: int = 0, followup_stats: dict | None = None):
+                auto_approved: int = 0, followup_stats: dict | None = None,
+                news_stats: dict | None = None):
     """Step 6: Send notification email with daily summary."""
     if not cfg.notification_email or not cfg.smtp_password:
         logger.info("Step 6: Notification skipped (no SMTP config)")
@@ -375,6 +376,16 @@ FOLLOW-UPS:
   Sent: {se.get('sent', 0)}, Failed: {se.get('failed', 0)}
 """
 
+    # Build news signal section
+    news_section = ""
+    if news_stats and news_stats.get("total_signals", 0) > 0:
+        news_section = f"""
+NEWS SIGNALS:
+  {news_stats.get('total_signals', 0)} signals detected
+  {news_stats.get('total_contacts_created', 0)} new contacts created
+  {news_stats.get('sources_scanned', 0)} sources scanned
+"""
+
     cap_info = ""
     can_send, sent_today, max_sends = queue_manager.check_daily_send_cap()
     cap_info = f"  Send Cap: {sent_today}/{max_sends}"
@@ -387,7 +398,7 @@ SENT TODAY: {sent} emails sent{f' ({failed} failed)' if failed else ''}
 AUTO-APPROVED: {auto_approved} bundles
 PREPPED FOR TOMORROW: {generated} bundles queued
 EMAILS DISCOVERED: {discovered}
-{reply_section}{followup_section}
+{reply_section}{followup_section}{news_section}
 PIPELINE STATS:
   Total Contacts: {stats['total_contacts']}
   Emails Found: {stats['emails_found']}
@@ -427,6 +438,24 @@ def step_flywheel() -> dict:
         return {}
 
 
+def step_news_scan() -> dict:
+    """Step 2.8: Scan local news for moving-service signals."""
+    logger.info("Step 2.8: Scanning news for business signals...")
+    try:
+        from outreach_engine.news_scanner import scan_all_sources
+        stats = scan_all_sources(auto_create_contacts=True)
+        if stats.get("enabled") is False:
+            logger.info("  News scanning disabled")
+            return stats
+        logger.info("  News scan: %d signals found, %d contacts created",
+                     stats.get("total_signals", 0),
+                     stats.get("total_contacts_created", 0))
+        return stats
+    except Exception as e:
+        logger.warning("  News scan failed: %s", e)
+        return {}
+
+
 def step_backup() -> str:
     """Step 7: Backup the database."""
     logger.info("Step 7: Backing up database...")
@@ -453,6 +482,7 @@ def run_daily_pipeline():
         generated = step_generate_bundles(cfg.daily_send_target)
         auto_approved = step_auto_approve()
         step_flywheel()
+        news_stats = step_news_scan()
 
         if generated < cfg.daily_send_target:
             backfilled = step_backfill(cfg.daily_send_target)
@@ -466,13 +496,14 @@ def run_daily_pipeline():
         step_backup()
         step_notify(discovered, generated, sent, reply_stats=reply_stats,
                     failed=failed, auto_approved=auto_approved,
-                    followup_stats=followup_stats)
+                    followup_stats=followup_stats, news_stats=news_stats)
 
         results = {
             "discovered": discovered, "generated": generated,
             "auto_approved": auto_approved,
             "sent": sent, "failed": failed,
             "followups": followup_stats,
+            "news_signals": news_stats.get("total_signals", 0),
         }
         queue_manager.log_pipeline_end(run_id, "completed", stats=results)
 
@@ -506,6 +537,7 @@ def run_daily_pipeline_headless(batch_size: int = 20) -> dict:
         "sent": 0,
         "failed": 0,
         "followups": {},
+        "news_stats": {},
         "backup": "",
     }
 
@@ -524,6 +556,9 @@ def run_daily_pipeline_headless(batch_size: int = 20) -> dict:
 
         # Step 2.5: Flywheel — grow contact list from engagement signals
         results["flywheel"] = step_flywheel()
+
+        # Step 2.8: News signal scan
+        results["news_stats"] = step_news_scan()
 
         # Step 3: Generate bundles for next batch
         results["generated"] = step_generate_bundles(batch_size)
@@ -548,6 +583,7 @@ def run_daily_pipeline_headless(batch_size: int = 20) -> dict:
             failed=results["failed"],
             auto_approved=results["auto_approved"],
             followup_stats=results["followups"],
+            news_stats=results["news_stats"],
         )
 
         # Step 7: Backup

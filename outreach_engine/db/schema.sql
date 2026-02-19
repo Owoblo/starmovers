@@ -138,3 +138,25 @@ CREATE TABLE IF NOT EXISTS follow_ups (
 
 CREATE INDEX IF NOT EXISTS idx_followups_date ON follow_ups(scheduled_date);
 CREATE INDEX IF NOT EXISTS idx_followups_status ON follow_ups(status);
+
+CREATE TABLE IF NOT EXISTS news_signals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_name TEXT NOT NULL,
+    source_url TEXT NOT NULL,
+    headline TEXT DEFAULT '',
+    content_snippet TEXT DEFAULT '',
+    signal_type TEXT NOT NULL,
+    company_name TEXT DEFAULT '',
+    opportunity TEXT DEFAULT '',
+    city TEXT DEFAULT '',
+    urgency TEXT DEFAULT 'medium',
+    recommended_action TEXT DEFAULT '',
+    contact_id INTEGER DEFAULT NULL,
+    status TEXT DEFAULT 'new',
+    published_date TEXT DEFAULT '',
+    scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_url ON news_signals(source_url);
+CREATE INDEX IF NOT EXISTS idx_signals_status ON news_signals(status);
+CREATE INDEX IF NOT EXISTS idx_signals_type ON news_signals(signal_type);

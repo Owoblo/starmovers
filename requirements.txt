@@ -8,3 +8,4 @@ beautifulsoup4>=4.12
 openai>=1.50
 apscheduler>=3.10
 xhtml2pdf>=0.2.11
+lxml>=5.0

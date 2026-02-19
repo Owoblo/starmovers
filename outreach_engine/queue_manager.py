@@ -853,6 +853,55 @@ def get_followup_stats() -> dict:
 # ── DB Backup ──
 
 
+# ── News Signals ──
+
+
+def get_news_signals(status: Optional[str] = None, signal_type: Optional[str] = None,
+                     limit: int = 50, offset: int = 0) -> list[dict]:
+    """Browse news signals with optional filters."""
+    conn = _get_conn()
+    where_parts = ["signal_type != 'none'"]
+    params: list = []
+    if status:
+        where_parts.append("status = ?")
+        params.append(status)
+    if signal_type:
+        where_parts.append("signal_type = ?")
+        params.append(signal_type)
+
+    where_clause = " AND ".join(where_parts)
+    rows = conn.execute(f"""
+        SELECT * FROM news_signals
+        WHERE {where_clause}
+        ORDER BY scraped_at DESC
+        LIMIT ? OFFSET ?
+    """, (*params, limit, offset)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_news_signal(signal_id: int) -> Optional[dict]:
+    """Get a single news signal by ID."""
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM news_signals WHERE id = ?", (signal_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def update_news_signal_status(signal_id: int, status: str) -> bool:
+    """Update a news signal's status (new → reviewed, contacted, dismissed)."""
+    conn = _get_conn()
+    conn.execute(
+        "UPDATE news_signals SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (status, signal_id),
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
 def backup_database() -> str:
     """Create a timestamped SQLite backup. Returns backup file path."""
     import shutil
