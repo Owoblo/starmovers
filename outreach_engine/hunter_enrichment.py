@@ -456,6 +456,96 @@ def enrich_account(contact_id: int) -> dict:
     }
 
 
+# ── Batch: verify 'likely' emails ──
+
+
+def verify_batch_likely(limit: int = 50) -> dict:
+    """Batch-verify contacts with email_status='likely' via Hunter.
+
+    Checks Hunter credit budget first, then verifies up to `limit` emails.
+    Updates each contact to 'verified' or 'invalid' based on Hunter result.
+
+    Returns stats dict: {promoted, invalidated, unchanged, credits_used, errors}.
+    """
+    budget = check_budget()
+    if not budget.get("available"):
+        logger.info("Hunter batch verify: no budget available — %s", budget.get("reason", ""))
+        return {"promoted": 0, "invalidated": 0, "unchanged": 0,
+                "credits_used": 0, "errors": 0, "skipped": "no_budget"}
+
+    remaining = budget.get("verifications_remaining", 0)
+    if remaining <= 0:
+        logger.info("Hunter batch verify: 0 verification credits remaining")
+        return {"promoted": 0, "invalidated": 0, "unchanged": 0,
+                "credits_used": 0, "errors": 0, "skipped": "no_credits"}
+
+    # Cap to available credits
+    actual_limit = min(limit, remaining)
+
+    conn = _get_conn()
+    rows = conn.execute("""
+        SELECT id, discovered_email, company_name FROM contacts
+        WHERE email_status = 'likely'
+        AND discovered_email != ''
+        AND account_status NOT IN ('dnc', 'explicit-no')
+        ORDER BY priority_score DESC, confidence_score DESC
+        LIMIT ?
+    """, (actual_limit,)).fetchall()
+    conn.close()
+
+    if not rows:
+        logger.info("Hunter batch verify: no 'likely' contacts to verify")
+        return {"promoted": 0, "invalidated": 0, "unchanged": 0,
+                "credits_used": 0, "errors": 0}
+
+    stats = {"promoted": 0, "invalidated": 0, "unchanged": 0,
+             "credits_used": 0, "errors": 0}
+
+    for row in rows:
+        email = row["discovered_email"]
+        contact_id = row["id"]
+
+        result = verify_email(email)
+        if "error" in result:
+            stats["errors"] += 1
+            logger.warning("Hunter verify failed for %s (#%d): %s",
+                           email, contact_id, result["error"])
+            continue
+
+        stats["credits_used"] += 1
+        hunter_result = result.get("result", "unknown")
+
+        # Map Hunter result to our status
+        if hunter_result == "deliverable":
+            new_status = "verified"
+            stats["promoted"] += 1
+        elif hunter_result == "undeliverable":
+            new_status = "invalid"
+            stats["invalidated"] += 1
+        else:
+            # risky/unknown — keep as likely
+            stats["unchanged"] += 1
+            continue
+
+        # Update contact
+        conn = _get_conn()
+        conn.execute("""
+            UPDATE contacts SET email_status = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """, (new_status, contact_id))
+        conn.commit()
+        conn.close()
+
+        logger.info("Hunter verify: %s (#%d %s) → %s",
+                     email, contact_id, row["company_name"], new_status)
+
+    logger.info("Hunter batch verify complete: %d promoted, %d invalidated, "
+                "%d unchanged, %d credits used",
+                stats["promoted"], stats["invalidated"],
+                stats["unchanged"], stats["credits_used"])
+    return stats
+
+
 # ── Batch: enrich top priority accounts ──
 
 

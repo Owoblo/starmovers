@@ -250,6 +250,8 @@ def ensure_db():
         );
         CREATE INDEX IF NOT EXISTS idx_hunter_usage_date
             ON hunter_usage_log(DATE(created_at));
+        CREATE INDEX IF NOT EXISTS idx_contacts_email_status
+            ON contacts(email_status);
     """)
 
     # contacts.linkedin_url column
@@ -495,6 +497,12 @@ def _send_single_bundle(bundle_id: int) -> dict:
     if email_status == "invalid":
         return {"bundle_id": bundle_id, "status": "email_invalid",
                 "error": "Email status is invalid"}
+
+    # Verified-only gate: refuse to send unverified emails
+    if cfg.send_only_verified and email_status != "verified":
+        return {"bundle_id": bundle_id, "status": "email_not_verified",
+                "error": f"Email status is '{email_status}' — send_only_verified is ON. "
+                         f"Verify via Hunter first."}
 
     # Pre-send enrichment: re-validate unknown emails before sending
     if email_status == "unknown" and bundle.get("discovered_email"):
@@ -1411,6 +1419,116 @@ def hunter_enrich_batch(req: HunterBatchRequest, background_tasks: BackgroundTas
     }
 
 
+class HunterVerifyBatchRequest(BaseModel):
+    limit: int = 50
+
+
+@app.post("/api/hunter/verify-batch-likely")
+def hunter_verify_batch_likely(req: HunterVerifyBatchRequest,
+                               background_tasks: BackgroundTasks):
+    """Batch-verify all 'likely' emails via Hunter — promotes to verified or invalid."""
+    from outreach_engine.hunter_enrichment import verify_batch_likely
+    stats = verify_batch_likely(limit=req.limit)
+    return stats
+
+
+# ── Bounce Reinvestigation ──
+
+_reinvestigate_progress: dict = {"running": False, "done": False, "results": {}}
+
+
+@app.post("/api/bounces/reinvestigate", status_code=202)
+def reinvestigate_bounces(background_tasks: BackgroundTasks):
+    """Re-investigate all bounced contacts: Hunter verify first, then rediscovery."""
+    global _reinvestigate_progress
+    if _reinvestigate_progress.get("running"):
+        raise HTTPException(status_code=409, detail="Reinvestigation already running")
+    _reinvestigate_progress = {"running": True, "done": False, "results": {}}
+    background_tasks.add_task(_reinvestigate_task)
+    return {"status": "started"}
+
+
+@app.get("/api/bounces/reinvestigate/progress")
+def reinvestigate_progress():
+    """Poll reinvestigation progress."""
+    return _reinvestigate_progress
+
+
+def _reinvestigate_task():
+    """Background: re-investigate all bounced contacts."""
+    global _reinvestigate_progress
+    import sqlite3
+
+    try:
+        conn = sqlite3.connect(str(cfg.db_path), timeout=30)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+
+        bounced = conn.execute("""
+            SELECT id, company_name, discovered_email, domain, contact_name
+            FROM contacts
+            WHERE email_status IN ('bounced', 'invalid')
+            AND account_status NOT IN ('dnc')
+            ORDER BY priority_score DESC
+        """).fetchall()
+        conn.close()
+
+        stats = {"total": len(bounced), "hunter_verified": 0, "hunter_invalid": 0,
+                 "rediscovered": 0, "still_bounced": 0, "errors": 0}
+
+        for row in bounced:
+            contact_id = row["id"]
+            email = row["discovered_email"]
+
+            # Step 1: Try Hunter verification on existing email first
+            if email:
+                try:
+                    from outreach_engine.hunter_enrichment import verify_email
+                    result = verify_email(email)
+                    if result.get("result") == "deliverable":
+                        # Email is actually good — update status
+                        c = sqlite3.connect(str(cfg.db_path), timeout=30)
+                        c.execute("""
+                            UPDATE contacts SET email_status = 'verified',
+                                   outreach_status = 'pending',
+                                   updated_at = CURRENT_TIMESTAMP
+                            WHERE id = ?
+                        """, (contact_id,))
+                        c.commit()
+                        c.close()
+                        stats["hunter_verified"] += 1
+                        logger.info("Reinvestigate #%d (%s): Hunter says %s is deliverable!",
+                                    contact_id, row["company_name"], email)
+                        continue
+                    elif result.get("result") == "undeliverable":
+                        stats["hunter_invalid"] += 1
+                except Exception as e:
+                    logger.debug("Hunter verify failed for #%d: %s", contact_id, e)
+
+            # Step 2: Full rediscovery with improved pipeline
+            try:
+                new_email, new_status = rediscover_email(contact_id)
+                if new_email and new_status in ("verified", "likely"):
+                    stats["rediscovered"] += 1
+                    logger.info("Reinvestigate #%d (%s): rediscovered %s (%s)",
+                                contact_id, row["company_name"], new_email, new_status)
+                else:
+                    stats["still_bounced"] += 1
+            except Exception as e:
+                stats["errors"] += 1
+                logger.warning("Reinvestigate #%d failed: %s", contact_id, e)
+
+        _reinvestigate_progress["results"] = stats
+        logger.info("Bounce reinvestigation complete: %s", stats)
+
+    except Exception as e:
+        _reinvestigate_progress["results"] = {"error": str(e)}
+        logger.exception("Reinvestigation task failed")
+    finally:
+        _reinvestigate_progress["done"] = True
+        _reinvestigate_progress["running"] = False
+
+
 # ── Telegram Bot Webhook ──
 
 @app.post("/api/telegram/webhook")
@@ -1866,6 +1984,18 @@ def _scheduled_account_maintenance():
         logger.exception("SCHEDULER: Account maintenance failed")
 
 
+def _scheduled_batch_verify():
+    """Scheduled task: batch-verify 'likely' emails via Hunter (8:30am, before 9am pipeline)."""
+    logger.info("SCHEDULER: Starting batch verify of 'likely' emails...")
+    try:
+        from outreach_engine.hunter_enrichment import verify_batch_likely
+        stats = verify_batch_likely(limit=50)
+        logger.info("SCHEDULER: Batch verify complete — %d promoted, %d invalidated",
+                     stats.get("promoted", 0), stats.get("invalidated", 0))
+    except Exception:
+        logger.exception("SCHEDULER: Batch verify failed")
+
+
 def _scheduled_telegram_group_flush():
     """Scheduled task: flush stale Telegram message groups (every 60s)."""
     try:
@@ -1970,6 +2100,16 @@ def _init_scheduler():
             CronTrigger(hour=cfg.account_maintenance_hour, minute=0),
             id="account_maintenance",
             name="Account Maintenance",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+
+        # Batch verify 'likely' emails via Hunter — 8:30am (before 9am pipeline)
+        _scheduler.add_job(
+            _scheduled_batch_verify,
+            CronTrigger(hour=8, minute=30),
+            id="batch_verify_likely",
+            name="Hunter Batch Verify (likely→verified)",
             replace_existing=True,
             misfire_grace_time=3600,
         )
@@ -2103,6 +2243,7 @@ def trigger_job(job_id: str, background_tasks: BackgroundTasks):
         "flywheel": _scheduled_flywheel,
         "news_scanner": _scheduled_news_scan,
         "account_maintenance": _scheduled_account_maintenance,
+        "batch_verify_likely": _scheduled_batch_verify,
         "telegram_group_flush": _scheduled_telegram_group_flush,
         "telegram_batch_research": _scheduled_telegram_batch_research,
         "telegram_daily_summary": _scheduled_telegram_daily_summary,

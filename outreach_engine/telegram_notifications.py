@@ -382,3 +382,27 @@ def check_stuck_stages():
         )
 
     logger.info("Stuck-stage check: pinged %d ideas", len(nudges))
+
+
+# ── Needs Manual ──
+
+def notify_needs_manual(contact_id: int, company_name: str,
+                        contact_name: str = "", reason: str = ""):
+    """Push notification when automated discovery exhausts all methods.
+
+    Flags the contact for manual email research (LinkedIn, phone call, etc).
+    """
+    lines = [
+        f"*[NEEDS MANUAL]* {company_name}",
+        f"Contact: {contact_name or 'Unknown'}",
+        f"Automated email discovery exhausted all methods.",
+    ]
+    if reason:
+        lines.append(f"Reason: {reason}")
+    lines.append("Action: Find email via LinkedIn, phone call, or website research.")
+
+    _send(
+        "\n".join(lines),
+        notification_type="needs_manual",
+        reference_id=contact_id,
+    )

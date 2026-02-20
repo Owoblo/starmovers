@@ -365,8 +365,11 @@ def _classify_reply_sentiment(body: str) -> str:
         return "neutral"
 
 
-def _get_sent_recipient_emails() -> set[str]:
-    """Get all email addresses we've sent outreach to."""
+def _get_sent_recipient_emails() -> tuple[set[str], set[str]]:
+    """Get all email addresses we've sent outreach to, plus their domains.
+
+    Returns (emails_set, domains_set).
+    """
     import sqlite3
     conn = sqlite3.connect(str(cfg.db_path))
     rows = conn.execute("""
@@ -378,10 +381,14 @@ def _get_sent_recipient_emails() -> set[str]:
     """).fetchall()
     conn.close()
     emails = set()
+    domains = set()
     for row in rows:
         for addr in _EMAIL_RE.findall(row[0] or ""):
-            emails.add(addr.lower())
-    return emails
+            addr = addr.lower()
+            emails.add(addr)
+            if "@" in addr:
+                domains.add(addr.split("@")[-1])
+    return emails, domains
 
 
 def scan_replies(days: int = 7) -> list[dict]:
@@ -396,7 +403,7 @@ def scan_replies(days: int = 7) -> list[dict]:
         logger.error("SMTP not configured for IMAP")
         return []
 
-    sent_emails = _get_sent_recipient_emails()
+    sent_emails, sent_domains = _get_sent_recipient_emails()
     if not sent_emails:
         logger.info("No sent outreach emails to match against")
         return []
@@ -418,6 +425,9 @@ def scan_replies(days: int = 7) -> list[dict]:
             f'(SUBJECT "Automatic reply" SINCE "{_imap_date(days)}")',
             f'(SUBJECT "Out of Office" SINCE "{_imap_date(days)}")',
             f'(SUBJECT "Auto:" SINCE "{_imap_date(days)}")',
+            f'(SUBJECT "Undeliverable" SINCE "{_imap_date(days)}")',
+            f'(SUBJECT "Delivery Status" SINCE "{_imap_date(days)}")',
+            f'(SUBJECT "Mail delivery failed" SINCE "{_imap_date(days)}")',
         ]:
             try:
                 _, data = imap.search(None, criteria)
@@ -448,8 +458,12 @@ def scan_replies(days: int = 7) -> list[dict]:
             if any(skip in from_email for skip in ("mailer-daemon", "postmaster", "noreply", "no-reply")):
                 continue
 
-            # Only process if sender matches a sent outreach recipient
-            if from_email not in sent_emails:
+            # Match by exact email OR by domain (cross-person reply)
+            from_domain = from_email.split("@")[-1] if "@" in from_email else ""
+            is_exact_match = from_email in sent_emails
+            is_domain_match = not is_exact_match and from_domain in sent_domains
+
+            if not is_exact_match and not is_domain_match:
                 continue
 
             # Skip duplicates
@@ -470,11 +484,13 @@ def scan_replies(days: int = 7) -> list[dict]:
 
             replies.append({
                 "from_email": from_email,
+                "from_domain": from_domain,
                 "subject": subject,
                 "body": body[:500],
                 "reply_type": reply_type,
                 "sentiment": sentiment,
                 "redirect_email": redirect_email,
+                "domain_match_only": is_domain_match,
             })
 
         imap.logout()
@@ -512,6 +528,7 @@ def process_replies(days: int = 7) -> dict:
 
     for reply in replies:
         from_email = reply["from_email"]
+        from_domain = reply.get("from_domain", "")
 
         # Match reply to a sent bundle by contact email
         row = conn.execute("""
@@ -522,6 +539,29 @@ def process_replies(days: int = 7) -> dict:
             WHERE b.status IN ('sent', 'replied', 'rejected')
             AND LOWER(c.discovered_email) = ?
         """, (from_email,)).fetchone()
+
+        # Fallback: domain-level match (different person at same company)
+        if not row and from_domain:
+            row = conn.execute("""
+                SELECT b.id, b.status, b.reply_type as existing_reply_type,
+                       c.discovered_email, c.company_name, b.contact_id
+                FROM outreach_bundles b
+                JOIN contacts c ON b.contact_id = c.id
+                WHERE b.status IN ('sent', 'replied', 'rejected')
+                AND c.domain = ?
+                ORDER BY b.sent_at DESC
+                LIMIT 1
+            """, (from_domain,)).fetchone()
+            if row:
+                logger.info("Domain-match reply: %s replied (we emailed %s at %s)",
+                           from_email, row["discovered_email"], row["company_name"])
+                # Log the alternate sender in contact notes
+                conn.execute("""
+                    UPDATE contacts
+                    SET notes = COALESCE(notes, '') || '\n[Reply from alternate: ' || ? || ']',
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (from_email, row["contact_id"]))
 
         if not row:
             continue

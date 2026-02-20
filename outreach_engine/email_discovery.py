@@ -488,10 +488,72 @@ def _log_discovery(conn: sqlite3.Connection, contact_id: int, step: str,
     )
 
 
+def _google_search_email(company_name: str, domain: str = "") -> str:
+    """Search Google for a company's contact email as a fallback layer.
+
+    Searches for '"company name" email contact' and extracts emails from results.
+    Returns the best email found, or empty string.
+    """
+    try:
+        query = f'"{company_name}" email contact'
+        if domain:
+            query += f" site:{domain} OR @{domain}"
+
+        resp = requests.get(
+            "https://www.google.com/search",
+            params={"q": query, "num": 5},
+            headers=_SCRAPE_HEADERS,
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            return ""
+
+        # Extract emails from search results page
+        found = _EMAIL_REGEX.findall(resp.text)
+        for email in found:
+            email = email.lower()
+            if validate_syntax(email) and not any(email.startswith(p) for p in _IGNORE_PREFIXES):
+                # Prefer domain-matching emails
+                if domain and email.endswith(f"@{domain}"):
+                    return email
+        # Return first valid email even if domain doesn't match
+        for email in found:
+            email = email.lower()
+            if validate_syntax(email) and not any(email.startswith(p) for p in _IGNORE_PREFIXES):
+                if not email.endswith((".png", ".jpg", ".svg", ".gif", ".css", ".js")):
+                    return email
+    except Exception as e:
+        logger.debug("Google search email failed for %s: %s", company_name, e)
+
+    return ""
+
+
+def _flag_needs_manual(conn: sqlite3.Connection, contact_id: int,
+                       company_name: str, contact_name: str,
+                       reason: str = ""):
+    """Flag a contact as needs_manual and send Telegram notification."""
+    conn.execute("""
+        UPDATE contacts SET email_status = 'needs_manual',
+               updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+    """, (contact_id,))
+    _log_discovery(conn, contact_id, "needs_manual", "flagged", reason)
+
+    # Send Telegram notification
+    try:
+        from outreach_engine.telegram_notifications import notify_needs_manual
+        notify_needs_manual(contact_id, company_name, contact_name, reason)
+    except Exception as e:
+        logger.debug("Telegram notify_needs_manual failed: %s", e)
+
+
 def discover_email(contact_id: int) -> tuple[str, str]:
     """Run full email discovery pipeline for a single contact.
 
     Returns (best_email, email_status).
+
+    When all automated methods are exhausted, flags the contact as
+    'needs_manual' instead of guessing a pattern email.
     """
     conn = sqlite3.connect(str(cfg.db_path))
     conn.row_factory = sqlite3.Row
@@ -503,6 +565,7 @@ def discover_email(contact_id: int) -> tuple[str, str]:
 
     website = contact["website"]
     contact_name = contact["contact_name"]
+    company_name = contact["company_name"]
     domain = contact["domain"] or _extract_domain(website)
 
     # Update domain if missing
@@ -545,7 +608,7 @@ def discover_email(contact_id: int) -> tuple[str, str]:
                         conn.commit()
                         conn.close()
                         logger.info("Hunter.io found %s for #%d (%s)",
-                                    h_email, contact_id, contact["company_name"])
+                                    h_email, contact_id, company_name)
                         return h_email, h_status
     except Exception as e:
         logger.debug("Hunter.io lookup skipped: %s", e)
@@ -553,13 +616,11 @@ def discover_email(contact_id: int) -> tuple[str, str]:
     # Step 2: MX check
     if not domain:
         _log_discovery(conn, contact_id, "mx", "skip", "no domain")
-        conn.execute(
-            "UPDATE contacts SET email_status = 'unknown', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            (contact_id,),
-        )
+        _flag_needs_manual(conn, contact_id, company_name, contact_name,
+                           "no domain — no website to extract from")
         conn.commit()
         conn.close()
-        return "", "unknown"
+        return "", "needs_manual"
 
     has_mx, mx_host = validate_mx(domain)
     _log_discovery(conn, contact_id, "mx", "pass" if has_mx else "fail", mx_host)
@@ -578,6 +639,13 @@ def discover_email(contact_id: int) -> tuple[str, str]:
     _log_discovery(conn, contact_id, "scrape", f"found:{len(scraped)}",
                    " | ".join(scraped[:5]))
 
+    # Step 3.5: Google search for email (fallback layer)
+    if not scraped:
+        google_email = _google_search_email(company_name, domain)
+        if google_email:
+            scraped.append(google_email)
+            _log_discovery(conn, contact_id, "google_search", "found", google_email)
+
     # Step 4: Generate name-based patterns
     first, last = _parse_name(contact_name)
     patterns = generate_email_variations(first, last, domain) if first else []
@@ -588,9 +656,12 @@ def discover_email(contact_id: int) -> tuple[str, str]:
     all_candidates = scraped + [p for p in patterns if p not in scraped]
 
     if not all_candidates:
-        # No candidates at all — try generic
-        all_candidates = [f"info@{domain}"]
-        _log_discovery(conn, contact_id, "fallback", "info@", "")
+        # No candidates at all — flag for manual research instead of guessing
+        _flag_needs_manual(conn, contact_id, company_name, contact_name,
+                           "no emails found via scrape, Google, or name patterns")
+        conn.commit()
+        conn.close()
+        return "", "needs_manual"
 
     # Step 5: SMTP probing
     catch_all = is_catch_all(domain)
@@ -617,12 +688,21 @@ def discover_email(contact_id: int) -> tuple[str, str]:
             best_email = email
             best_status = "likely"
 
-    # Fallback: if no SMTP confirmation, use pattern scoring
-    if not best_email and all_candidates:
-        scored = sorted(all_candidates, key=_pattern_score, reverse=True)
-        best_email = scored[0]
-        best_status = "likely"
-        _log_discovery(conn, contact_id, "pattern_score", "fallback", best_email)
+    # If SMTP probing found nothing and we only have patterns (no scraped emails),
+    # flag as needs_manual instead of guessing
+    if not best_email:
+        if scraped:
+            # We had scraped emails but none confirmed — use best scraped one
+            best_email = scraped[0]
+            best_status = "likely"
+            _log_discovery(conn, contact_id, "scraped_fallback", "likely", best_email)
+        else:
+            # Only had pattern-guessed emails — don't guess, flag for manual
+            _flag_needs_manual(conn, contact_id, company_name, contact_name,
+                               "SMTP probing inconclusive, no scraped emails to fall back on")
+            conn.commit()
+            conn.close()
+            return "", "needs_manual"
 
     # Update contact
     conn.execute("""

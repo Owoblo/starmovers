@@ -91,6 +91,25 @@ def step_discover(limit: int = 60) -> int:
     return found
 
 
+def step_verify_likely(limit: int = 50) -> dict:
+    """Step 1.5: Batch-verify 'likely' emails via Hunter before bundle generation.
+
+    Promotes likely → verified (or invalid) using available Hunter credits.
+    This ensures we have verified contacts for the send queue.
+    """
+    logger.info("Step 1.5: Batch-verifying 'likely' emails via Hunter (up to %d)...", limit)
+    try:
+        from outreach_engine.hunter_enrichment import verify_batch_likely
+        stats = verify_batch_likely(limit=limit)
+        logger.info("  Verified: %d promoted, %d invalidated, %d unchanged (credits used: %d)",
+                     stats.get("promoted", 0), stats.get("invalidated", 0),
+                     stats.get("unchanged", 0), stats.get("credits_used", 0))
+        return stats
+    except Exception as e:
+        logger.warning("  Batch verify failed: %s", e)
+        return {}
+
+
 def step_generate_bundles(batch_size: int = 40) -> int:
     """Step 2: Select contacts and generate email bundles."""
     logger.info("Step 2: Generating bundles (target: %d)...", batch_size)
@@ -204,7 +223,11 @@ def step_backfill(target: int = 40, max_rounds: int = MAX_BACKFILL_ROUNDS) -> in
 
 def step_send_approved() -> tuple[int, int]:
     """Step 4: Send approved bundles with staggered timing + daily cap.
-    Returns (sent_count, failed_count)."""
+
+    Belt-and-suspenders: even if a bundle was approved, skip it if
+    cfg.send_only_verified is True and the email isn't verified.
+    Returns (sent_count, failed_count).
+    """
     # Check daily send cap
     can_send, sent_today, max_sends = queue_manager.check_daily_send_cap()
     if not can_send:
@@ -225,6 +248,7 @@ def step_send_approved() -> tuple[int, int]:
                 len(bundle_ids), budget, max_sends)
     sent_count = 0
     failed_count = 0
+    skipped_unverified = 0
 
     for bid in bundle_ids:
         bundle = queue_manager.get_bundle(bid)
@@ -238,6 +262,13 @@ def step_send_approved() -> tuple[int, int]:
 
         if bundle.get("email_status") == "invalid":
             logger.warning("  Bundle %d: email invalid, skipping", bid)
+            continue
+
+        # Belt-and-suspenders: verified-only gate
+        if cfg.send_only_verified and bundle.get("email_status") != "verified":
+            skipped_unverified += 1
+            logger.warning("  Bundle %d: email_status='%s' (not verified), skipping — send_only_verified is ON",
+                           bid, bundle.get("email_status"))
             continue
 
         import uuid
@@ -272,6 +303,8 @@ def step_send_approved() -> tuple[int, int]:
         logger.info("  Waiting %ds before next send...", delay)
         time.sleep(delay)
 
+    if skipped_unverified:
+        logger.info("  Skipped %d bundles (email not verified)", skipped_unverified)
     logger.info("  Sent %d/%d bundles (%d failed)", sent_count, len(bundle_ids), failed_count)
     queue_manager.update_daily_stats(
         date.today().isoformat(), bundles_sent=sent_count,
@@ -748,6 +781,7 @@ def run_daily_pipeline():
         reply_stats = step_scan_replies()
         acct_stats = step_account_maintenance()
         discovered = step_discover(cfg.discovery_batch_size)
+        step_verify_likely(limit=50)
         generated = step_generate_bundles(cfg.daily_send_target)
         auto_approved = step_auto_approve()
         step_flywheel()
@@ -801,6 +835,7 @@ def run_daily_pipeline_headless(batch_size: int = 20) -> dict:
         "reply_stats": {},
         "flywheel": {},
         "discovered": 0,
+        "verify_likely": {},
         "generated": 0,
         "auto_approved": 0,
         "backfilled": 0,
@@ -827,6 +862,9 @@ def run_daily_pipeline_headless(batch_size: int = 20) -> dict:
 
         # Step 2: Discover emails
         results["discovered"] = step_discover(cfg.discovery_batch_size)
+
+        # Step 2.2: Batch-verify 'likely' emails before bundle generation
+        results["verify_likely"] = step_verify_likely(limit=50)
 
         # Step 2.5: Flywheel — grow contact list from engagement signals
         results["flywheel"] = step_flywheel()

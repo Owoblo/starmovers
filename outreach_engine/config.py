@@ -112,6 +112,10 @@ class _Config:
     hunter_api_key: str = os.getenv("HUNTER_API_KEY", "")
     hunter_daily_cap: int = int(os.getenv("HUNTER_DAILY_CAP", "100"))
 
+    # Verified-only sending — when True, only email_status='verified' contacts can be sent
+    # Set to False to allow 'likely' emails through (original behavior)
+    send_only_verified: bool = os.getenv("SEND_ONLY_VERIFIED", "true").lower() == "true"
+
     # Confidence routing thresholds
     confidence_auto_threshold: int = int(os.getenv("CONFIDENCE_AUTO_THRESHOLD", "70"))
     confidence_manual_threshold: int = int(os.getenv("CONFIDENCE_MANUAL_THRESHOLD", "40"))

@@ -291,21 +291,27 @@ def record_email_open(tracking_id: str, ip_address: str = "", user_agent: str = 
 
 
 def select_next_batch(batch_size: int = 40) -> list[int]:
-    """Select next contacts to process, one per domain, ordered by priority."""
+    """Select next contacts to process, one per domain, ordered by priority.
+
+    When cfg.send_only_verified is True, only selects contacts with
+    email_status='verified'. Otherwise allows 'verified' and 'likely'.
+    """
     conn = _get_conn()
 
-    # Get contacts with discovered emails that haven't been sent yet
-    rows = conn.execute("""
+    allowed_statuses = ("verified",) if cfg.send_only_verified else ("verified", "likely")
+    placeholders = ",".join("?" * len(allowed_statuses))
+
+    rows = conn.execute(f"""
         SELECT c.id, c.domain FROM contacts c
         WHERE c.outreach_status = 'pending'
-        AND c.email_status IN ('verified', 'likely')
+        AND c.email_status IN ({placeholders})
         AND c.discovered_email != ''
         AND c.account_status != 'dnc'
         AND c.id NOT IN (
             SELECT contact_id FROM outreach_bundles WHERE status NOT IN ('skipped', 'bounced')
         )
         ORDER BY c.priority_score DESC, c.id ASC
-    """).fetchall()
+    """, allowed_statuses).fetchall()
     conn.close()
 
     # One per domain
@@ -476,16 +482,22 @@ def get_discovery_stats() -> dict:
 
 
 def get_up_next(limit: int = 20) -> list[dict]:
-    """Get pending contacts not yet in bundles — the next batch candidates."""
+    """Get pending contacts not yet in bundles — the next batch candidates.
+
+    Respects cfg.send_only_verified to filter email statuses.
+    """
     conn = _get_conn()
-    rows = conn.execute("""
+    allowed_statuses = ("verified",) if cfg.send_only_verified else ("verified", "likely")
+    placeholders = ",".join("?" * len(allowed_statuses))
+
+    rows = conn.execute(f"""
         SELECT
             c.id, c.company_name, c.contact_name, c.title_role,
             c.tier, c.industry_code, c.priority_score,
             c.discovered_email, c.email_status, c.city, c.website
         FROM contacts c
         WHERE c.outreach_status = 'pending'
-        AND c.email_status IN ('verified', 'likely')
+        AND c.email_status IN ({placeholders})
         AND c.discovered_email != ''
         AND c.account_status != 'dnc'
         AND c.id NOT IN (
@@ -493,24 +505,30 @@ def get_up_next(limit: int = 20) -> list[dict]:
         )
         ORDER BY c.priority_score DESC, c.id ASC
         LIMIT ?
-    """, (limit,)).fetchall()
+    """, (*allowed_statuses, limit)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
 def get_up_next_total() -> int:
-    """Count of pending contacts not yet in bundles."""
+    """Count of pending contacts not yet in bundles.
+
+    Respects cfg.send_only_verified to filter email statuses.
+    """
     conn = _get_conn()
-    row = conn.execute("""
+    allowed_statuses = ("verified",) if cfg.send_only_verified else ("verified", "likely")
+    placeholders = ",".join("?" * len(allowed_statuses))
+
+    row = conn.execute(f"""
         SELECT COUNT(*) as cnt FROM contacts c
         WHERE c.outreach_status = 'pending'
-        AND c.email_status IN ('verified', 'likely')
+        AND c.email_status IN ({placeholders})
         AND c.discovered_email != ''
         AND c.account_status != 'dnc'
         AND c.id NOT IN (
             SELECT contact_id FROM outreach_bundles WHERE status NOT IN ('skipped', 'bounced')
         )
-    """).fetchone()
+    """, allowed_statuses).fetchone()
     conn.close()
     return row["cnt"]
 
@@ -682,7 +700,10 @@ def remaining_send_budget() -> int:
 
 def auto_approve_bundles(batch_date: str | None = None) -> int:
     """Auto-approve queued bundles for well-tested industry templates.
-    Skips manual_review_codes (CR25, HOT25, etc). Returns count approved."""
+    Skips manual_review_codes (CR25, HOT25, etc).
+    When cfg.send_only_verified is True, only approves bundles where
+    the contact's email_status is 'verified'.
+    Returns count approved."""
     if not cfg.auto_approve:
         return 0
 
@@ -691,6 +712,10 @@ def auto_approve_bundles(batch_date: str | None = None) -> int:
     skip_codes = cfg.manual_review_codes
 
     placeholders = ",".join("?" * len(skip_codes))
+
+    # When send_only_verified, only auto-approve verified emails
+    email_filter = "AND c.email_status = 'verified'" if cfg.send_only_verified else ""
+
     rows = conn.execute(f"""
         SELECT b.id, c.industry_code
         FROM outreach_bundles b
@@ -698,6 +723,7 @@ def auto_approve_bundles(batch_date: str | None = None) -> int:
         WHERE b.status = 'queued'
         AND b.batch_date = ?
         AND c.industry_code NOT IN ({placeholders})
+        {email_filter}
     """, (d, *skip_codes)).fetchall()
 
     count = 0
