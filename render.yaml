@@ -37,6 +37,20 @@ services:
         value: "johnowolabi80@gmail.com"
       - key: AUTO_APPROVE
         value: "true"
+      - key: SEND_ONLY_VERIFIED
+        value: "true"
+      - key: DASHBOARD_URL
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET
+        sync: false
+      - key: TELEGRAM_SETUP_TOKEN
+        sync: false
+      - key: HUNTER_API_KEY
+        sync: false
       - key: AUTO_SCHEDULE
         value: "true"
       - key: MAX_DAILY_SENDS

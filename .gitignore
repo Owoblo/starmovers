@@ -15,6 +15,15 @@ outreach_engine/db/outreach.db
 outreach_engine/db/outreach.db-shm
 outreach_engine/db/outreach.db-wal
 outreach_engine/db/backups/
+outreach.db
+outreach.db-shm
+outreach.db-wal
+
+# Runtime logs
+*.log
+
+# Office temp/lock files
+~$*
 
 # Generated files
 outreach_engine/onepagers/
