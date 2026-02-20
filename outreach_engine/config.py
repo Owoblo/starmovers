@@ -108,6 +108,10 @@ class _Config:
     telegram_research_hours: str = os.getenv("TELEGRAM_RESEARCH_HOURS", "9,15")
     telegram_daily_summary_hour: int = int(os.getenv("TELEGRAM_DAILY_SUMMARY_HOUR", "20"))
 
+    # Hunter.io
+    hunter_api_key: str = os.getenv("HUNTER_API_KEY", "")
+    hunter_daily_cap: int = int(os.getenv("HUNTER_DAILY_CAP", "100"))
+
     # Confidence routing thresholds
     confidence_auto_threshold: int = int(os.getenv("CONFIDENCE_AUTO_THRESHOLD", "70"))
     confidence_manual_threshold: int = int(os.getenv("CONFIDENCE_MANUAL_THRESHOLD", "40"))

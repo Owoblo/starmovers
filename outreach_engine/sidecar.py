@@ -238,6 +238,29 @@ def ensure_db():
         CREATE INDEX IF NOT EXISTS idx_research_priority ON account_research(priority);
     """)
 
+    # Hunter.io usage tracking
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS hunter_usage_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            endpoint TEXT NOT NULL,
+            domain TEXT DEFAULT '',
+            credits_used INTEGER DEFAULT 1,
+            detail TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_hunter_usage_date
+            ON hunter_usage_log(DATE(created_at));
+    """)
+
+    # contacts.linkedin_url column
+    for col, typedef in [
+        ("linkedin_url", "TEXT DEFAULT ''"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE contacts ADD COLUMN {col} {typedef}")
+        except Exception:
+            pass
+
     # Telegram tables
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS telegram_messages (
@@ -1304,6 +1327,88 @@ def create_contact_from_idea(idea_id: int, req: IdeaContactRequest):
     if not contact_id:
         raise HTTPException(status_code=400, detail="Could not create contact")
     return {"idea_id": idea_id, "contact_id": contact_id, "status": "contact_created"}
+
+
+# ── Hunter.io Enrichment ──
+
+class HunterDomainRequest(BaseModel):
+    domain: str
+    limit: int = 10
+
+
+class HunterFindRequest(BaseModel):
+    domain: str
+    first_name: str
+    last_name: str
+
+
+class HunterVerifyRequest(BaseModel):
+    email: str
+
+
+class HunterBatchRequest(BaseModel):
+    limit: int = 5
+    min_tier: str = "A"
+
+
+@app.get("/api/hunter/budget")
+def hunter_budget():
+    """Check remaining Hunter.io credits for the month."""
+    from outreach_engine.hunter_enrichment import check_budget, get_usage_month
+    budget = check_budget()
+    usage = get_usage_month()
+    return {"budget": budget, "usage_this_month": usage}
+
+
+@app.post("/api/hunter/domain-search")
+def hunter_domain_search(req: HunterDomainRequest):
+    """Search all emails at a domain via Hunter.io."""
+    from outreach_engine.hunter_enrichment import domain_search
+    result = domain_search(req.domain, limit=req.limit)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@app.post("/api/hunter/find-email")
+def hunter_find_email(req: HunterFindRequest):
+    """Find a specific person's email via Hunter.io."""
+    from outreach_engine.hunter_enrichment import find_email
+    result = find_email(req.domain, req.first_name, req.last_name)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@app.post("/api/hunter/verify")
+def hunter_verify_email(req: HunterVerifyRequest):
+    """Verify an email address via Hunter.io."""
+    from outreach_engine.hunter_enrichment import verify_email
+    result = verify_email(req.email)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@app.post("/api/hunter/enrich/{contact_id}")
+def hunter_enrich_account(contact_id: int, background_tasks: BackgroundTasks):
+    """Full Hunter enrichment for a commercial account — domain search + verify + update contact."""
+    from outreach_engine.hunter_enrichment import enrich_account
+    result = enrich_account(contact_id)
+    if "error" in result:
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
+
+
+@app.post("/api/hunter/enrich-batch")
+def hunter_enrich_batch(req: HunterBatchRequest, background_tasks: BackgroundTasks):
+    """Enrich a batch of high-priority accounts via Hunter.io."""
+    from outreach_engine.hunter_enrichment import enrich_batch
+    results = enrich_batch(limit=req.limit, min_tier=req.min_tier)
+    return {
+        "enriched": len(results),
+        "results": results,
+    }
 
 
 # ── Telegram Bot Webhook ──

@@ -514,6 +514,42 @@ def discover_email(contact_id: int) -> tuple[str, str]:
         conn.close()
         return contact["discovered_email"], contact["email_status"]
 
+    # Step 2a: Hunter.io lookup (if API key configured + high-priority contact)
+    try:
+        from outreach_engine.config import cfg as _cfg
+        if _cfg.hunter_api_key and domain:
+            # Only auto-use Hunter for Tier A or field intel contacts
+            tier = contact["tier"] if "tier" in contact.keys() else ""
+            source = contact["csv_source"] if "csv_source" in contact.keys() else ""
+            if tier == "A" or source == "field_intel":
+                from outreach_engine.hunter_enrichment import find_email as hunter_find
+                first, last = _parse_name(contact_name)
+                if first and last:
+                    hunter_result = hunter_find(domain, first, last)
+                    if hunter_result.get("found") and hunter_result.get("email"):
+                        h_email = hunter_result["email"]
+                        h_score = hunter_result.get("score", 0)
+                        h_status = "verified" if h_score >= 90 else "likely"
+                        _log_discovery(conn, contact_id, "hunter_find", h_status,
+                                       f"{h_email} score={h_score}")
+                        conn.execute("""
+                            UPDATE contacts
+                            SET discovered_email = ?, email_status = ?,
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE id = ?
+                        """, (h_email, h_status, contact_id))
+                        if hunter_result.get("linkedin"):
+                            conn.execute(
+                                "UPDATE contacts SET linkedin_url = ? WHERE id = ?",
+                                (hunter_result["linkedin"], contact_id))
+                        conn.commit()
+                        conn.close()
+                        logger.info("Hunter.io found %s for #%d (%s)",
+                                    h_email, contact_id, contact["company_name"])
+                        return h_email, h_status
+    except Exception as e:
+        logger.debug("Hunter.io lookup skipped: %s", e)
+
     # Step 2: MX check
     if not domain:
         _log_discovery(conn, contact_id, "mx", "skip", "no domain")
